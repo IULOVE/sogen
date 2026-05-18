@@ -1,6 +1,8 @@
 #pragma once
 
-// NOLINTBEGIN(modernize-use-using,cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
+#include "kernel_mapped.hpp"
+
+// NOLINTBEGIN(modernize-use-using,cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-use-enum-class)
 
 #define ACCESS_MASK              DWORD
 #define DEVICE_TYPE              DWORD
@@ -59,22 +61,58 @@
 #define FILE_SYNCHRONOUS_IO_NONALERT   0x00000020
 #define FILE_NON_DIRECTORY_FILE        0x00000040
 #define FILE_CREATE_TREE_CONNECTION    0x00000080
+#define FILE_DELETE_ON_CLOSE           0x00001000
 
-#define FILE_ATTRIBUTE_NORMAL          0x00000080
-#define FILE_ATTRIBUTE_DIRECTORY       0x00000010
+#define FILE_USE_FILE_POINTER_POSITION 0xfffffffe
+#define FILE_WRITE_TO_END_OF_FILE      0xffffffff
 
-#define PS_ATTRIBUTE_NUMBER_MASK       0x0000ffff
-#define PS_ATTRIBUTE_THREAD            0x00010000 // may be used with thread creation
-#define PS_ATTRIBUTE_INPUT             0x00020000 // input only
-#define PS_ATTRIBUTE_ADDITIVE          0x00040000 // "accumulated" e.g. bitmasks, counters, etc.
+#define FILE_BYTE_ALIGNMENT            ((1 << (1 - 1)) - 1)
+#define FILE_WORD_ALIGNMENT            ((1 << (2 - 1)) - 1)
+#define FILE_LONG_ALIGNMENT            ((1 << (3 - 1)) - 1)
+#define FILE_QUAD_ALIGNMENT            ((1 << (4 - 1)) - 1)
+#define FILE_OCTA_ALIGNMENT            ((1 << (5 - 1)) - 1)
+#define FILE_32_BYTE_ALIGNMENT         ((1 << (6 - 1)) - 1)
+#define FILE_64_BYTE_ALIGNMENT         ((1 << (7 - 1)) - 1)
+#define FILE_128_BYTE_ALIGNMENT        ((1 << (8 - 1)) - 1)
+#define FILE_256_BYTE_ALIGNMENT        ((1 << (9 - 1)) - 1)
+#define FILE_512_BYTE_ALIGNMENT        ((1 << (10 - 1)) - 1)
 
-#define SL_RESTART_SCAN                0x01
-#define SL_RETURN_SINGLE_ENTRY         0x02
-#define SL_NO_CURSOR_UPDATE            0x10
+#define FILE_MODE_MASK                                                                                        \
+    (FILE_WRITE_THROUGH | FILE_SEQUENTIAL_ONLY | FILE_NO_INTERMEDIATE_BUFFERING | FILE_SYNCHRONOUS_IO_ALERT | \
+     FILE_SYNCHRONOUS_IO_NONALERT | FILE_DELETE_ON_CLOSE)
+
+#define FILE_ATTRIBUTE_NORMAL                      0x00000080
+#define FILE_ATTRIBUTE_DIRECTORY                   0x00000010
+
+#define FILE_DISPOSITION_DO_NOT_DELETE             (0x00000000)
+#define FILE_DISPOSITION_DELETE                    (0x00000001)
+#define FILE_DISPOSITION_POSIX_SEMANTICS           (0x00000002)
+#define FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK (0x00000004)
+#define FILE_DISPOSITION_ON_CLOSE                  (0x00000008)
+#define FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE (0x00000010)
+
+#define PS_ATTRIBUTE_NUMBER_MASK                   0x0000ffff
+#define PS_ATTRIBUTE_THREAD                        0x00010000 // may be used with thread creation
+#define PS_ATTRIBUTE_INPUT                         0x00020000 // input only
+#define PS_ATTRIBUTE_ADDITIVE                      0x00040000 // "accumulated" e.g. bitmasks, counters, etc.
+
+#define SL_RESTART_SCAN                            0x01
+#define SL_RETURN_SINGLE_ENTRY                     0x02
+#define SL_NO_CURSOR_UPDATE                        0x10
 
 #ifndef SEC_IMAGE
-#define SEC_IMAGE   0x01000000
-#define SEC_RESERVE 0x04000000
+#define SEC_HUGE_PAGES             0x00020000
+#define SEC_PARTITION_OWNER_HANDLE 0x00040000
+#define SEC_64K_PAGES              0x00080000
+#define SEC_FILE                   0x00800000
+#define SEC_IMAGE                  0x01000000
+#define SEC_PROTECTED_IMAGE        0x02000000
+#define SEC_RESERVE                0x04000000
+#define SEC_COMMIT                 0x08000000
+#define SEC_NOCACHE                0x10000000
+#define SEC_WRITECOMBINE           0x40000000
+#define SEC_LARGE_PAGES            0x80000000
+#define SEC_IMAGE_NO_EXECUTE       (SEC_IMAGE | SEC_NOCACHE)
 #endif
 
 #define CTL_CODE(DeviceType, Function, Method, Access) (((DeviceType) << 16) | ((Access) << 14) | ((Function) << 2) | (Method))
@@ -233,6 +271,29 @@ using OBJECT_INFORMATION_CLASS = enum _OBJECT_INFORMATION_CLASS
     MaxObjectInfoClass
 };
 
+using WORKERFACTORYINFOCLASS = enum _WORKERFACTORYINFOCLASS
+{
+    WorkerFactoryTimeout = 0,
+    WorkerFactoryRetryTimeout,
+    WorkerFactoryIdleTimeout,
+    WorkerFactoryBindingCount,
+    WorkerFactoryThreadMinimum,
+    WorkerFactoryThreadMaximum,
+    WorkerFactoryPaused,
+    WorkerFactoryBasicInformation,
+    WorkerFactoryAdjustThreadGoal,
+    WorkerFactoryCallbackType,
+    WorkerFactoryStackInformation,
+    WorkerFactoryThreadBasePriority,
+    WorkerFactoryTimeoutWaiters,
+    WorkerFactoryFlags,
+    WorkerFactoryThreadSoftMaximum,
+    WorkerFactoryThreadCpuSets,
+    MaxWorkerFactoryInfoClass
+};
+
+constexpr auto WORKER_FACTORY_FLAG_LOADER_POOL = 0x1; // real name is unknown
+
 using HARDERROR_RESPONSE_OPTION = enum _HARDERROR_RESPONSE_OPTION
 {
     OptionAbortRetryIgnore,
@@ -276,6 +337,14 @@ struct IO_STATUS_BLOCK
 };
 
 template <typename Traits>
+struct FILE_IO_COMPLETION_INFORMATION
+{
+    typename Traits::PVOID KeyContext;
+    typename Traits::PVOID ApcContext;
+    IO_STATUS_BLOCK<Traits> IoStatusBlock;
+};
+
+template <typename Traits>
 struct OBJECT_ATTRIBUTES
 {
     ULONG Length;
@@ -294,6 +363,15 @@ typedef struct _FILE_FS_SIZE_INFORMATION
     ULONG BytesPerSector;
 } FILE_FS_SIZE_INFORMATION, *PFILE_FS_SIZE_INFORMATION;
 
+typedef struct _FILE_FS_FULL_SIZE_INFORMATION
+{
+    LARGE_INTEGER TotalAllocationUnits;
+    LARGE_INTEGER CallerAvailableAllocationUnits;
+    LARGE_INTEGER ActualAvailableAllocationUnits;
+    ULONG SectorsPerAllocationUnit;
+    ULONG BytesPerSector;
+} FILE_FS_FULL_SIZE_INFORMATION, *PFILE_FS_FULL_SIZE_INFORMATION;
+
 typedef struct _FILE_FS_VOLUME_INFORMATION
 {
     LARGE_INTEGER VolumeCreationTime;
@@ -309,16 +387,47 @@ typedef struct _FILE_FS_DEVICE_INFORMATION
     ULONG Characteristics;
 } FILE_FS_DEVICE_INFORMATION, *PFILE_FS_DEVICE_INFORMATION;
 
+typedef struct _FILE_FS_ATTRIBUTE_INFORMATION
+{
+    ULONG FileSystemAttributes;
+    LONG MaximumComponentNameLength;
+    ULONG FileSystemNameLength;
+    char16_t FileSystemName[10];
+} FILE_FS_ATTRIBUTE_INFORMATION, *PFILE_FS_ATTRIBUTE_INFORMATION;
+
 typedef struct _FILE_POSITION_INFORMATION
 {
     LARGE_INTEGER CurrentByteOffset;
 } FILE_POSITION_INFORMATION, *PFILE_POSITION_INFORMATION;
+
+typedef struct _FILE_END_OF_FILE_INFORMATION
+{
+    LARGE_INTEGER EndOfFile;
+} FILE_END_OF_FILE_INFORMATION, *PFILE_END_OF_FILE_INFORMATION;
 
 typedef struct _FILE_ATTRIBUTE_TAG_INFORMATION
 {
     ULONG FileAttributes;
     ULONG ReparseTag;
 } FILE_ATTRIBUTE_TAG_INFORMATION, *PFILE_ATTRIBUTE_TAG_INFORMATION;
+
+typedef struct _FILE_IS_REMOTE_DEVICE_INFORMATION
+{
+    BOOLEAN IsRemote;
+} FILE_IS_REMOTE_DEVICE_INFORMATION, *PFILE_IS_REMOTE_DEVICE_INFORMATION;
+
+#ifndef OS_WINDOWS
+typedef struct _FILE_ID_128
+{
+    BYTE Identifier[16];
+} FILE_ID_128, *PFILE_ID_128;
+#endif
+
+typedef struct _FILE_ID_INFORMATION
+{
+    ULONGLONG VolumeSerialNumber;
+    FILE_ID_128 FileId;
+} FILE_ID_INFORMATION, *PFILE_ID_INFORMATION;
 
 typedef struct _FILE_STANDARD_INFORMATION
 {
@@ -412,12 +521,70 @@ typedef struct _FILE_RENAME_INFORMATION
     char16_t FileName[1];
 } FILE_RENAME_INFORMATION, *PFILE_RENAME_INFORMATION;
 
-#ifndef OS_WINDOWS
-typedef struct _FILE_ID_128
+typedef struct _FILE_DISPOSITION_INFORMATION
 {
-    BYTE Identifier[16];
-} FILE_ID_128, *PFILE_ID_128;
+    BOOLEAN DeleteFile;
+} FILE_DISPOSITION_INFORMATION, *PFILE_DISPOSITION_INFORMATION;
 
+struct FILE_DISPOSITION_INFORMATION_EX
+{
+    ULONG Flags;
+};
+
+typedef struct _FILE_STREAM_INFORMATION
+{
+    ULONG NextEntryOffset;
+    ULONG StreamNameLength;
+    LARGE_INTEGER StreamSize;
+    LARGE_INTEGER StreamAllocationSize;
+    char16_t StreamName[1];
+} FILE_STREAM_INFORMATION, *PFILE_STREAM_INFORMATION;
+
+typedef struct _FILE_INTERNAL_INFORMATION
+{
+    LARGE_INTEGER IndexNumber;
+} FILE_INTERNAL_INFORMATION, *PFILE_INTERNAL_INFORMATION;
+
+typedef struct _FILE_EA_INFORMATION
+{
+    ULONG EaSize;
+} FILE_EA_INFORMATION, *PFILE_EA_INFORMATION;
+
+typedef struct _FILE_ACCESS_INFORMATION
+{
+    ACCESS_MASK AccessFlags;
+} FILE_ACCESS_INFORMATION, *PFILE_ACCESS_INFORMATION;
+
+typedef struct _FILE_MODE_INFORMATION
+{
+    ULONG Mode;
+} FILE_MODE_INFORMATION, *PFILE_MODE_INFORMATION;
+
+typedef struct _FILE_ALIGNMENT_INFORMATION
+{
+    ULONG AlignmentRequirement;
+} FILE_ALIGNMENT_INFORMATION, *PFILE_ALIGNMENT_INFORMATION;
+
+typedef struct _FILE_ALL_INFORMATION
+{
+    FILE_BASIC_INFORMATION BasicInformation;
+    FILE_STANDARD_INFORMATION StandardInformation;
+    FILE_INTERNAL_INFORMATION InternalInformation;
+    FILE_EA_INFORMATION EaInformation;
+    FILE_ACCESS_INFORMATION AccessInformation;
+    FILE_POSITION_INFORMATION PositionInformation;
+    FILE_MODE_INFORMATION ModeInformation;
+    FILE_ALIGNMENT_INFORMATION AlignmentInformation;
+    FILE_NAME_INFORMATION NameInformation;
+} FILE_ALL_INFORMATION, *PFILE_ALL_INFORMATION;
+
+typedef struct _FILE_VOLUME_NAME_INFORMATION
+{
+    ULONG DeviceNameLength;
+    char16_t DeviceName[1];
+} FILE_VOLUME_NAME_INFORMATION, *PFILE_VOLUME_NAME_INFORMATION;
+
+#ifndef OS_WINDOWS
 typedef BOOLEAN SECURITY_CONTEXT_TRACKING_MODE, *PSECURITY_CONTEXT_TRACKING_MODE;
 typedef struct _SECURITY_QUALITY_OF_SERVICE
 {
@@ -471,4 +638,4 @@ typedef struct _OBJECT_HANDLE_FLAG_INFORMATION
     BOOLEAN ProtectFromClose;
 } OBJECT_HANDLE_FLAG_INFORMATION, *POBJECT_HANDLE_FLAG_INFORMATION;
 
-// NOLINTEND(modernize-use-using,cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
+// NOLINTEND(modernize-use-using,cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-use-enum-class)

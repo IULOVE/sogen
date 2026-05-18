@@ -21,6 +21,15 @@ namespace unicorn
 
         static_assert(static_cast<uint32_t>(x86_register::end) == UC_X86_REG_ENDING);
 
+        constexpr auto IA32_FS_BASE_MSR = 0xC0000100;
+        constexpr auto IA32_GS_BASE_MSR = 0xC0000101;
+
+        struct msr_value
+        {
+            uint64_t id{};
+            uint64_t value{};
+        };
+
         uc_x86_insn map_hookable_instruction(const x86_hookable_instructions instruction)
         {
             switch (instruction)
@@ -253,15 +262,6 @@ namespace unicorn
 
             void set_segment_base(const x86_register base, const pointer_type value) override
             {
-                constexpr auto IA32_FS_BASE_MSR = 0xC0000100;
-                constexpr auto IA32_GS_BASE_MSR = 0xC0000101;
-
-                struct msr_value
-                {
-                    uint64_t id{};
-                    uint64_t value{};
-                };
-
                 msr_value msr_val{
                     .id = 0,
                     .value = value,
@@ -282,6 +282,30 @@ namespace unicorn
                 }
 
                 this->write_register(x86_register::msr, &msr_val, sizeof(msr_val));
+            }
+
+            pointer_type get_segment_base(const x86_register base) override
+            {
+                msr_value msr_val{};
+
+                switch (base)
+                {
+                case x86_register::fs:
+                case x86_register::fs_base:
+                    msr_val.id = IA32_FS_BASE_MSR;
+                    break;
+                case x86_register::gs:
+                case x86_register::gs_base:
+                    msr_val.id = IA32_GS_BASE_MSR;
+                    break;
+                default:
+                    return 0;
+                }
+
+                size_t result_size = sizeof(msr_value);
+                uce(uc_reg_read2(*this, (int)x86_register::msr, &msr_val, &result_size));
+
+                return msr_val.value;
             }
 
             size_t write_raw_register(const int reg, const void* value, const size_t size) override
@@ -309,6 +333,22 @@ namespace unicorn
                 }
 
                 return result_size;
+            }
+
+            bool read_descriptor_table(const int reg, descriptor_table_register& table) override
+            {
+                if (reg != static_cast<int>(x86_register::gdtr) && reg != static_cast<int>(x86_register::idtr))
+                {
+                    return false;
+                }
+
+                uc_x86_mmr gdt{};
+
+                this->read_register(x86_register::gdtr, &gdt, sizeof(gdt));
+
+                table.base = gdt.base;
+                table.limit = gdt.limit;
+                return true;
             }
 
             void map_mmio(const uint64_t address, const size_t size, mmio_read_callback read_cb, mmio_write_callback write_cb) override
@@ -360,6 +400,11 @@ namespace unicorn
             void read_memory(const uint64_t address, void* data, const size_t size) const override
             {
                 uce(uc_mem_read(*this, address, data, size));
+            }
+
+            bool try_write_memory(const uint64_t address, const void* data, const size_t size) override
+            {
+                return uc_mem_write(*this, address, data, size) == UC_ERR_OK;
             }
 
             void write_memory(const uint64_t address, const void* data, const size_t size) override
@@ -472,18 +517,19 @@ namespace unicorn
                         const auto operation = map_memory_operation(type);
                         const auto violation = map_memory_violation_type(type);
 
-                        const auto resume =
-                            c(address, static_cast<uint64_t>(size), operation, violation) == memory_violation_continuation::resume;
+                        const auto result = c(address, static_cast<uint64_t>(size), operation, violation);
+                        const auto restart = result == memory_violation_continuation::restart;
+                        const auto resume = result == memory_violation_continuation::resume || restart;
 
                         const auto new_ip = this->read_instruction_pointer();
-                        const auto has_ip_changed = ip != new_ip;
+                        const auto set_ip = ip != new_ip || restart;
 
                         if (!resume)
                         {
                             return false;
                         }
 
-                        if (resume && has_ip_changed)
+                        if (resume && set_ip)
                         {
                             this->violation_ip_ = new_ip;
                         }
@@ -492,7 +538,7 @@ namespace unicorn
                             this->violation_ip_ = std::nullopt;
                         }
 
-                        if (has_ip_changed)
+                        if (set_ip)
                         {
                             return false;
                         }
@@ -524,7 +570,7 @@ namespace unicorn
                 unicorn_hook hook{*this};
 
                 uce(uc_hook_add(*this, hook.make_reference(), UC_HOOK_CODE, wrapper.get_function(), wrapper.get_user_data(), address,
-                                address + size));
+                                calc_end_address(address, size)));
 
                 auto* container = this->create_hook_container();
                 container->add(std::move(wrapper), std::move(hook));
@@ -555,8 +601,9 @@ namespace unicorn
                 function_wrapper<void, uc_engine*, uc_mem_type, uint64_t, int, int64_t> wrapper(std::move(read_wrapper));
 
                 unicorn_hook hook{*this};
+
                 uce(uc_hook_add(*this, hook.make_reference(), UC_HOOK_MEM_READ_AFTER, wrapper.get_function(), wrapper.get_user_data(),
-                                address, address + size));
+                                address, calc_end_address(address, size)));
 
                 auto* container = this->create_hook_container();
                 container->add(std::move(wrapper), std::move(hook));
@@ -579,7 +626,7 @@ namespace unicorn
                 unicorn_hook hook{*this};
 
                 uce(uc_hook_add(*this, hook.make_reference(), UC_HOOK_MEM_WRITE, wrapper.get_function(), wrapper.get_user_data(), address,
-                                address + size));
+                                calc_end_address(address, size)));
 
                 auto* container = this->create_hook_container();
                 container->add(std::move(wrapper), std::move(hook));
@@ -658,6 +705,11 @@ namespace unicorn
                 return this->violation_ip_.has_value();
             }
 
+            bool supports_instruction_counting() const override
+            {
+                return true;
+            }
+
             std::string get_name() const override
             {
                 return "Unicorn Engine";
@@ -669,6 +721,27 @@ namespace unicorn
             std::optional<uint64_t> violation_ip_{};
             std::vector<std::unique_ptr<hook_object>> hooks_{};
             std::unordered_map<uint64_t, mmio_callbacks> mmio_{};
+
+            static uint64_t calc_end_address(const uint64_t address, uint64_t size)
+            {
+                if (size == 0)
+                {
+                    size = 1;
+                }
+                else if (size == std::numeric_limits<uint64_t>::max())
+                {
+                    size = 0;
+                }
+
+                auto end_address = address + size - 1;
+
+                if (end_address < address)
+                {
+                    end_address = std::numeric_limits<uint64_t>::max();
+                }
+
+                return end_address;
+            }
         };
     }
 

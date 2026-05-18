@@ -8,7 +8,9 @@
 #include <utils/time.hpp>
 
 struct process_context;
+struct fake_environment_config;
 class windows_emulator;
+class windows_version_manager;
 
 class kusd_mmio
 {
@@ -38,7 +40,7 @@ class kusd_mmio
 
     static uint64_t address();
 
-    void setup();
+    void setup(const windows_version_manager& version, const fake_environment_config& fake_env);
 
   private:
     memory_manager* memory_{};

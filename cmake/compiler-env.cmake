@@ -25,23 +25,29 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 ##########################################
 
-if(NOT MINGW AND NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
+if(SOGEN_ENABLE_LTO AND NOT MOMO_ENABLE_CLANG_TIDY AND NOT MINGW AND NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_DEBUG OFF)
 endif()
 
 ##########################################
 
-if(MOMO_BUILD_AS_LIBRARY)
-    add_compile_definitions(MOMO_BUILD_AS_LIBRARY=1)
+if(SOGEN_BUILD_STATIC)
+    add_compile_definitions(SOGEN_BUILD_STATIC=1)
 else()
-    add_compile_definitions(MOMO_BUILD_AS_LIBRARY=0)
+    add_compile_definitions(SOGEN_BUILD_STATIC=0)
 endif()
 
 ##########################################
 
 set(MOMO_ENABLE_RUST OFF)
 if(MOMO_ENABLE_RUST_CODE AND NOT MINGW AND NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
-  set(MOMO_ENABLE_RUST ON)
+  find_program(CARGO cargo)
+  if(CARGO)
+    set(MOMO_ENABLE_RUST ON)
+  else()
+    message(STATUS "cargo not found; disabling Rust-backed components")
+  endif()
 endif()
 
 ##########################################
@@ -78,21 +84,33 @@ endif()
 
 ##########################################
 
-if(LINUX)
-  add_link_options(
-    -Wl,--no-undefined
-    -Wl,--gc-sections
-    -Wl,-z,now
-    -Wl,-z,noexecstack
-    -static-libstdc++
+if(LINUX OR APPLE)
+  momo_add_c_and_cxx_compile_options(
+    -fdiagnostics-color=always
   )
 
-  momo_add_c_and_cxx_compile_options(
+  momo_add_c_and_cxx_release_compile_options(
     -ffunction-sections
     -fdata-sections
     -fstack-protector-strong
-    -fdiagnostics-color=always
   )
+  
+  if(LINUX)
+    add_link_options(
+      -Wl,--no-undefined
+      -Wl,-z,now
+      -Wl,-z,noexecstack
+      -static-libstdc++
+    )
+
+    momo_add_release_link_options(
+      -Wl,--gc-sections
+    )
+  else()
+    momo_add_release_link_options(
+      -dead_strip
+    )
+  endif()
 
   add_compile_definitions(
     _REENTRANT
@@ -122,7 +140,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
     -sALLOW_MEMORY_GROWTH=1
     $<$<CONFIG:Debug>:-sASSERTIONS>
     -sWASM_BIGINT
-    -sUSE_OFFSET_CONVERTER
+    #-sUSE_OFFSET_CONVERTER
     #-sEXCEPTION_CATCHING_ALLOWED=[..]
     -sEXIT_RUNTIME
     -sASYNCIFY
@@ -181,6 +199,15 @@ if(MSVC)
     /Zc:__cplusplus
   )
 
+  momo_add_c_and_cxx_release_compile_options(
+    /Gw
+  )
+
+  momo_add_release_link_options(
+    /OPT:REF
+    /OPT:ICF
+  )
+
   add_link_options(
     /INCREMENTAL:NO
   )
@@ -217,10 +244,33 @@ if(MOMO_ENABLE_SANITIZER)
 endif()
 
 ##########################################
-# Must be a dynamic runtime (/MD or /MDd) to enforce
-# shared allocators between emulator and implementation
+# MSVC Runtime Library Selection
+#
+# Default is dynamic runtime (/MD or /MDd) to enforce shared allocators
+# between emulator and implementation.
+#
+# Use SOGEN_STATIC_CRT=ON for static runtime (/MT or /MTd) when embedding
+# in projects that require it (e.g., IDA plugins).
+#
+# WARNING: Static CRT may cause heap corruption if memory is allocated
+# in one module and freed in another. Ensure allocation ownership is clear.
 
-set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded$<$<CONFIG:Debug>:Debug>DLL)
+option(SOGEN_STATIC_CRT "Use static CRT (/MT) instead of dynamic (/MD)" OFF)
+
+if(SOGEN_STATIC_CRT AND NOT SOGEN_BUILD_STATIC)
+  message(FATAL_ERROR
+    "SOGEN_STATIC_CRT=ON requires SOGEN_BUILD_STATIC=ON.\n"
+    "Static CRT with shared libraries causes heap corruption - "
+    "each DLL gets its own allocator, but sogen passes ownership across boundaries.")
+endif()
+
+if(SOGEN_STATIC_CRT)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+elseif(DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
+  # Respect parent project's setting
+else()
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif()
 
 ##########################################
 

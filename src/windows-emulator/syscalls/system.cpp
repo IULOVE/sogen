@@ -199,12 +199,14 @@ namespace syscalls
                                                                   });
 
         case SystemProcessorInformation:
-            return handle_query<SYSTEM_PROCESSOR_INFORMATION64>(c.emu, system_information, system_information_length, return_length,
-                                                                [&](SYSTEM_PROCESSOR_INFORMATION64& info) {
-                                                                    memset(&info, 0, sizeof(info));
-                                                                    info.MaximumProcessors = 2;
-                                                                    info.ProcessorArchitecture = PROCESSOR_ARCHITECTURE_AMD64;
-                                                                });
+        case SystemEmulationProcessorInformation:
+            return handle_query<SYSTEM_PROCESSOR_INFORMATION64>(
+                c.emu, system_information, system_information_length, return_length, [&](SYSTEM_PROCESSOR_INFORMATION64& info) {
+                    memset(&info, 0, sizeof(info));
+                    info.MaximumProcessors = 2;
+                    info.ProcessorArchitecture =
+                        (info_class == SystemProcessorInformation ? PROCESSOR_ARCHITECTURE_AMD64 : PROCESSOR_ARCHITECTURE_INTEL);
+                });
 
         case SystemNumaProcessorMap:
             return handle_query<SYSTEM_NUMA_INFORMATION64>(c.emu, system_information, system_information_length, return_length,
@@ -270,6 +272,32 @@ namespace syscalls
                                                                 basic_info.ActiveProcessorsAffinityMask = 0x0000000000000f;
                                                                 basic_info.NumberOfProcessors = 4;
                                                             });
+
+        case SystemSupportedProcessorArchitectures: {
+            constexpr auto num_arch = 2;
+
+            const auto required_length = sizeof(SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES_INFORMATION) * (num_arch + 1);
+            if (system_information_length < required_length)
+            {
+                if (return_length)
+                {
+                    return_length.try_write(required_length);
+                }
+
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+
+            std::array<SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES_INFORMATION, num_arch + 1> supported_arch{};
+            supported_arch[0].Machine = IMAGE_FILE_MACHINE_AMD64;
+            supported_arch[0].KernelMode = 1;
+            supported_arch[0].UserMode = 1;
+            supported_arch[0].Native = 1;
+            supported_arch[1].Machine = IMAGE_FILE_MACHINE_I386;
+            supported_arch[1].UserMode = 1;
+
+            c.emu.write_memory(system_information, supported_arch);
+            return STATUS_SUCCESS;
+        }
 
         default:
             c.win_emu.log.error("Unsupported system info class: %X\n", info_class);

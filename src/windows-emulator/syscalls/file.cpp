@@ -3,19 +3,15 @@
 #include "../syscall_utils.hpp"
 #include "utils/io.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <utils/finally.hpp>
 #include <utils/wildcard.hpp>
+#include "utils/stat.hpp"
 
 #include <sys/stat.h>
 
 #include "../devices/named_pipe.hpp"
-
-#if defined(OS_WINDOWS)
-#define fstat64 _fstat64
-#elif defined(OS_MAC)
-#define fstat64 fstat
-#endif
 
 namespace syscalls
 {
@@ -51,16 +47,20 @@ namespace syscalls
                                          const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
                                          const uint64_t file_information, const ULONG length, const FILE_INFORMATION_CLASS info_class)
     {
-        const auto* f = c.proc.files.get(file_handle);
+        auto* f = c.proc.files.get(file_handle);
         if (!f)
         {
             if (c.proc.devices.get(file_handle))
             {
-                c.win_emu.log.error("Unsupported set device info class: %X\n", info_class);
                 return STATUS_SUCCESS;
             }
 
             return STATUS_INVALID_HANDLE;
+        }
+
+        if (info_class == FileBasicInformation)
+        {
+            return STATUS_SUCCESS;
         }
 
         if (info_class == FileRenameInformation)
@@ -88,12 +88,61 @@ namespace syscalls
 
             c.win_emu.log.warn("--> File rename requested: %s --> %s\n", u16_to_u8(f->name).c_str(), u16_to_u8(new_name).c_str());
 
-            return STATUS_ACCESS_DENIED;
+            std::error_code ec{};
+            bool file_exists = std::filesystem::exists(new_name, ec);
+
+            if (ec)
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+
+            if (!info.ReplaceIfExists && file_exists)
+            {
+                return STATUS_OBJECT_NAME_EXISTS;
+            }
+
+            f->handle.defer_rename(c.win_emu.file_sys.translate(f->name), c.win_emu.file_sys.translate(new_name));
+
+            return STATUS_SUCCESS;
         }
 
-        if (info_class == FileBasicInformation)
+        if (info_class == FileDispositionInformation)
         {
-            return STATUS_NOT_SUPPORTED;
+            if (length < sizeof(FILE_DISPOSITION_INFORMATION))
+            {
+                return STATUS_BUFFER_OVERFLOW;
+            }
+
+            if (!(f->access_mask & DELETE))
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+
+            const auto info = c.emu.read_memory<FILE_DISPOSITION_INFORMATION>(file_information);
+
+            f->handle.defer_delete(info.DeleteFile ? c.win_emu.file_sys.translate(f->name) : std::filesystem::path{});
+
+            return STATUS_SUCCESS;
+        }
+
+        if (info_class == FileDispositionInformationEx)
+        {
+            if (length < sizeof(FILE_DISPOSITION_INFORMATION_EX))
+            {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+
+            const auto info = c.emu.read_memory<FILE_DISPOSITION_INFORMATION_EX>(file_information);
+            const bool wants_delete = (info.Flags & FILE_DISPOSITION_DELETE) != 0;
+
+            if (wants_delete && !(f->access_mask & DELETE))
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+
+            f->handle.defer_delete(wants_delete ? c.win_emu.file_sys.translate(f->name) : std::filesystem::path{});
+
+            return STATUS_SUCCESS;
         }
 
         if (info_class == FilePositionInformation)
@@ -126,7 +175,34 @@ namespace syscalls
             return STATUS_SUCCESS;
         }
 
-        c.win_emu.log.error("Unsupported set file info class: %X\n", info_class);
+        if (info_class == FileEndOfFileInformation)
+        {
+            if (!f->handle)
+            {
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            if (length < sizeof(FILE_END_OF_FILE_INFORMATION))
+            {
+                return STATUS_BUFFER_OVERFLOW;
+            }
+
+            const auto info = c.emu.read_memory<FILE_END_OF_FILE_INFORMATION>(file_information);
+
+            if (!f->handle.resize(info.EndOfFile.QuadPart))
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            return STATUS_SUCCESS;
+        }
+
+        if (info_class == FileAllocationInformation)
+        {
+            return STATUS_SUCCESS;
+        }
+
+        c.win_emu.log.error("Unsupported set file info class: 0x%X\n", info_class);
         c.emu.stop();
 
         return STATUS_NOT_SUPPORTED;
@@ -163,12 +239,32 @@ namespace syscalls
                                                               info.AvailableAllocationUnits.QuadPart = 0x1000;
                                                           });
 
+        case FileFsFullSizeInformation:
+            return handle_query<FILE_FS_FULL_SIZE_INFORMATION>(c.emu, fs_information, length, io_status_block,
+                                                               [&](FILE_FS_FULL_SIZE_INFORMATION& info) {
+                                                                   info.BytesPerSector = 0x1000;
+                                                                   info.SectorsPerAllocationUnit = 0x1000;
+                                                                   info.TotalAllocationUnits.QuadPart = 0x10000;
+                                                                   info.CallerAvailableAllocationUnits.QuadPart = 0x1000;
+                                                                   info.ActualAvailableAllocationUnits.QuadPart = 0x1000;
+                                                               });
+
         case FileFsVolumeInformation:
             return handle_query<FILE_FS_VOLUME_INFORMATION>(c.emu, fs_information, length, io_status_block,
                                                             [&](FILE_FS_VOLUME_INFORMATION&) {});
 
+        case FileFsAttributeInformation:
+            return handle_query<_FILE_FS_ATTRIBUTE_INFORMATION>(
+                c.emu, fs_information, length, io_status_block, [&](_FILE_FS_ATTRIBUTE_INFORMATION& info) {
+                    info.FileSystemAttributes = 0x40006; // FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK | FILE_NAMED_STREAMS
+                    info.MaximumComponentNameLength = 255;
+                    constexpr auto name = u"NTFS"sv;
+                    info.FileSystemNameLength = static_cast<ULONG>(name.size() * sizeof(char16_t));
+                    memcpy(info.FileSystemName, name.data(), info.FileSystemNameLength);
+                });
+
         default:
-            c.win_emu.log.error("Unsupported fs info class: %X\n", fs_information_class);
+            c.win_emu.log.error("Unsupported fs info class: 0x%X\n", fs_information_class);
             c.emu.stop();
             return write_io_status(io_status_block, STATUS_NOT_SUPPORTED, true);
         }
@@ -196,7 +292,7 @@ namespace syscalls
 
             files.emplace_back(file_entry{
                 .file_path = file.path().filename(),
-                .file_size = file.file_size(),
+                .file_size = file.is_directory() ? 0 : file.file_size(),
                 .is_directory = file.is_directory(),
             });
         }
@@ -217,7 +313,7 @@ namespace syscalls
 
             files.emplace_back(file_entry{
                 .file_path = filename,
-                .file_size = dir_entry.file_size(),
+                .file_size = dir_entry.is_directory() ? 0 : dir_entry.file_size(),
                 .is_directory = dir_entry.is_directory(),
             });
         });
@@ -375,21 +471,24 @@ namespace syscalls
 
     NTSTATUS handle_NtQueryInformationFile(const syscall_context& c, const handle file_handle,
                                            const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
-                                           const uint64_t file_information, const uint32_t length, const uint32_t info_class)
+                                           const uint64_t file_information, uint32_t length, const uint32_t info_class)
     {
-        IO_STATUS_BLOCK<EmulatorTraits<Emu64>> block{};
-        block.Status = STATUS_SUCCESS;
-        block.Information = 0;
+        if (info_class == 0 || info_class >= FileMaximumInformation)
+        {
+            return STATUS_INVALID_INFO_CLASS;
+        }
 
-        const auto _ = utils::finally([&] {
-            if (io_status_block)
-            {
-                io_status_block.write(block);
-            }
-        });
+        auto block = io_status_block.try_read();
+        if (!block.has_value())
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
 
-        const auto ret = [&](const NTSTATUS status) {
-            block.Status = status;
+        const auto _ = utils::finally([&] { io_status_block.write(block.value()); });
+
+        const auto ret = [&](const NTSTATUS status, size_t size = 0) {
+            block->Status = status;
+            block->Information = size;
             return status;
         };
 
@@ -399,117 +498,18 @@ namespace syscalls
             return ret(STATUS_INVALID_HANDLE);
         }
 
-        if (info_class == FileNameInformation || info_class == FileNormalizedNameInformation)
-        {
-            const auto relative_path = u"\\" + windows_path(f->name).without_drive().u16string();
-            const auto required_length = sizeof(FILE_NAME_INFORMATION) + (relative_path.size() * 2);
-
-            block.Information = required_length;
-
-            if (length < block.Information)
-            {
-                return ret(STATUS_BUFFER_OVERFLOW);
-            }
-
-            c.emu.write_memory(file_information, FILE_NAME_INFORMATION{
-                                                     .FileNameLength = static_cast<ULONG>(relative_path.size() * 2),
-                                                     .FileName = {},
-                                                 });
-
-            c.emu.write_memory(file_information + offsetof(FILE_NAME_INFORMATION, FileName), relative_path.c_str(),
-                               (relative_path.size() + 1) * 2);
-
-            return ret(STATUS_SUCCESS);
-        }
-
-        if (info_class == FileStandardInformation)
-        {
-            block.Information = sizeof(FILE_STANDARD_INFORMATION);
-
-            if (length < block.Information)
-            {
-                return ret(STATUS_BUFFER_OVERFLOW);
-            }
-
-            const emulator_object<FILE_STANDARD_INFORMATION> info{c.emu, file_information};
-            FILE_STANDARD_INFORMATION i{};
-            i.Directory = f->is_directory() ? TRUE : FALSE;
-
-            if (f->handle)
-            {
-                i.EndOfFile.QuadPart = f->handle.size();
-            }
-
-            info.write(i);
-
-            return ret(STATUS_SUCCESS);
-        }
-
-        if (info_class == FileBasicInformation)
-        {
-            block.Information = sizeof(FILE_BASIC_INFORMATION);
-
-            if (length < block.Information)
-            {
-                return ret(STATUS_BUFFER_OVERFLOW);
-            }
-
-            struct _stat64 file_stat{};
-            if (fstat64(f->handle, &file_stat) != 0)
-            {
-                return STATUS_INVALID_HANDLE;
-            }
-
-            const emulator_object<FILE_BASIC_INFORMATION> info{c.emu, file_information};
-            FILE_BASIC_INFORMATION i{};
-
-            i.CreationTime = utils::convert_unix_to_windows_time(file_stat.st_atime);
-            i.LastAccessTime = utils::convert_unix_to_windows_time(file_stat.st_atime);
-            i.LastWriteTime = utils::convert_unix_to_windows_time(file_stat.st_mtime);
-            i.ChangeTime = i.LastWriteTime;
-            i.FileAttributes = (file_stat.st_mode & S_IFDIR) != 0 ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
-
-            info.write(i);
-
-            return ret(STATUS_SUCCESS);
-        }
-
-        if (info_class == FilePositionInformation)
-        {
-            if (!f->handle)
-            {
-                return ret(STATUS_NOT_SUPPORTED);
-            }
-
-            block.Information = sizeof(FILE_POSITION_INFORMATION);
-
-            if (length < block.Information)
-            {
-                return ret(STATUS_BUFFER_OVERFLOW);
-            }
-
-            const emulator_object<FILE_POSITION_INFORMATION> info{c.emu, file_information};
-            FILE_POSITION_INFORMATION i{};
-
-            i.CurrentByteOffset.QuadPart = f->handle.tell();
-
-            info.write(i);
-
-            return ret(STATUS_SUCCESS);
-        }
-
         if (info_class == FileAttributeTagInformation)
         {
-            if (!f->handle)
+            if (!f->handle && !f->is_directory())
             {
                 return ret(STATUS_NOT_SUPPORTED);
             }
 
-            block.Information = sizeof(FILE_ATTRIBUTE_TAG_INFORMATION);
+            constexpr auto required_length = sizeof(FILE_ATTRIBUTE_TAG_INFORMATION);
 
-            if (length < block.Information)
+            if (length < required_length)
             {
-                return ret(STATUS_BUFFER_OVERFLOW);
+                return ret(STATUS_INFO_LENGTH_MISMATCH);
             }
 
             const emulator_object<FILE_ATTRIBUTE_TAG_INFORMATION> info{c.emu, file_information};
@@ -519,15 +519,450 @@ namespace syscalls
 
             info.write(i);
 
-            return ret(STATUS_SUCCESS);
+            return ret(STATUS_SUCCESS, required_length);
         }
 
-        if (info_class == FileAllInformation)
+        if (info_class == FileIsRemoteDeviceInformation)
         {
-            return ret(STATUS_NOT_SUPPORTED);
+            if (!f->handle)
+            {
+                return ret(STATUS_NOT_SUPPORTED);
+            }
+
+            constexpr auto required_length = sizeof(FILE_IS_REMOTE_DEVICE_INFORMATION);
+
+            if (length < required_length)
+            {
+                return ret(STATUS_INFO_LENGTH_MISMATCH);
+            }
+
+            const emulator_object<FILE_IS_REMOTE_DEVICE_INFORMATION> info{c.emu, file_information};
+            FILE_IS_REMOTE_DEVICE_INFORMATION i{};
+
+            i.IsRemote = FALSE;
+
+            info.write(i);
+
+            return ret(STATUS_SUCCESS, required_length);
         }
 
-        c.win_emu.log.error("Unsupported query file info class: %X\n", info_class);
+        if (info_class == FileRemoteProtocolInformation)
+        {
+            return ret(STATUS_INVALID_PARAMETER);
+        }
+
+        if (info_class == FileIdInformation)
+        {
+            if (!f->handle)
+            {
+                return ret(STATUS_NOT_SUPPORTED);
+            }
+
+            constexpr auto required_length = sizeof(FILE_ID_INFORMATION);
+
+            if (length < required_length)
+            {
+                return ret(STATUS_INFO_LENGTH_MISMATCH);
+            }
+
+            struct compat_stat file_stat{};
+            if (!compat_fstat(f->handle.file_descriptor(), &file_stat))
+            {
+                return ret(STATUS_INVALID_HANDLE);
+            }
+
+            const emulator_object<FILE_ID_INFORMATION> info{c.emu, file_information};
+            FILE_ID_INFORMATION i{};
+
+            i.VolumeSerialNumber = f->drive_number;
+            memset(&i.FileId, 0, sizeof(i.FileId));
+            memcpy(&i.FileId.Identifier[0], &file_stat.st_ino, sizeof(file_stat.st_ino));
+
+            info.write(i);
+
+            return ret(STATUS_SUCCESS, required_length);
+        }
+
+        if (info_class == FileStreamInformation)
+        {
+            const std::u16string stream_name = u"::$DATA";
+            const auto stream_name_len = static_cast<uint32_t>(stream_name.size() * sizeof(char16_t));
+
+            const uint32_t required_length = offsetof(FILE_STREAM_INFORMATION, StreamName) + stream_name_len;
+
+            if (length < required_length)
+            {
+                return ret(STATUS_INFO_LENGTH_MISMATCH);
+            }
+
+            struct compat_stat file_stat{};
+            if (f->handle && !compat_fstat(f->handle.file_descriptor(), &file_stat))
+            {
+                return ret(STATUS_INVALID_HANDLE);
+            }
+
+            FILE_STREAM_INFORMATION info{};
+            info.NextEntryOffset = 0;
+            info.StreamNameLength = stream_name_len;
+
+            if (f->is_directory())
+            {
+                info.StreamSize.QuadPart = 0;
+                info.StreamAllocationSize.QuadPart = 0;
+            }
+            else
+            {
+                info.StreamSize.QuadPart = file_stat.st_size;
+                info.StreamAllocationSize.QuadPart = file_stat.st_size;
+            }
+
+            c.emu.write_memory(file_information, info);
+            c.emu.write_memory(file_information + offsetof(FILE_STREAM_INFORMATION, StreamName), stream_name.c_str(), stream_name_len);
+
+            return ret(STATUS_SUCCESS, required_length);
+        }
+
+        if (info_class == FileVolumeNameInformation)
+        {
+            const auto volume_name = u8_to_u16("\\Device\\HarddiskVolume" + std::to_string(f->drive_number));
+            const auto name_bytes = static_cast<uint32_t>(volume_name.size() * sizeof(char16_t));
+
+            const uint32_t required_length = offsetof(FILE_VOLUME_NAME_INFORMATION, DeviceName) + name_bytes;
+
+            if (length < required_length)
+            {
+                return ret(STATUS_INFO_LENGTH_MISMATCH);
+            }
+
+            FILE_VOLUME_NAME_INFORMATION vni{};
+            vni.DeviceNameLength = name_bytes;
+
+            c.emu.write_memory(file_information, vni);
+            c.emu.write_memory(file_information + offsetof(FILE_VOLUME_NAME_INFORMATION, DeviceName), volume_name.c_str(), name_bytes);
+
+            return ret(STATUS_SUCCESS, required_length);
+        }
+
+        const auto all_info = info_class == FileAllInformation;
+        size_t all_length = 0;
+
+        if (all_info && length < sizeof(FILE_ALL_INFORMATION))
+        {
+            return ret(STATUS_INFO_LENGTH_MISMATCH);
+        }
+
+        if (info_class == FileBasicInformation || all_info)
+        {
+            constexpr auto required_length = sizeof(FILE_BASIC_INFORMATION);
+
+            if (length < required_length)
+            {
+                return ret(STATUS_INFO_LENGTH_MISMATCH);
+            }
+
+            struct compat_stat file_stat{};
+            if (f->handle && !compat_fstat(f->handle.file_descriptor(), &file_stat))
+            {
+                return STATUS_INVALID_HANDLE;
+            }
+
+            const bool is_directory = f->handle ? (file_stat.st_mode & S_IFDIR) != 0 : f->is_directory();
+
+            auto address = file_information;
+            if (all_info)
+            {
+                address += offsetof(FILE_ALL_INFORMATION, BasicInformation);
+            }
+
+            const emulator_object<FILE_BASIC_INFORMATION> info{c.emu, address};
+            FILE_BASIC_INFORMATION i{};
+            i.CreationTime = convert_timespec_to_filetime(file_stat.st_ctimespec);
+            i.LastAccessTime = convert_timespec_to_filetime(file_stat.st_atimespec);
+            i.LastWriteTime = convert_timespec_to_filetime(file_stat.st_mtimespec);
+            i.ChangeTime = i.LastWriteTime;
+            i.FileAttributes = is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+
+            info.write(i);
+
+            if (!all_info)
+            {
+                return ret(STATUS_SUCCESS, required_length);
+            }
+
+            length -= required_length;
+            all_length += required_length;
+        }
+
+        if (info_class == FileStandardInformation || all_info)
+        {
+            constexpr auto required_length = sizeof(FILE_STANDARD_INFORMATION);
+
+            if (length < required_length)
+            {
+                return ret(STATUS_INFO_LENGTH_MISMATCH);
+            }
+
+            auto address = file_information;
+            if (all_info)
+            {
+                address += offsetof(FILE_ALL_INFORMATION, StandardInformation);
+            }
+
+            const emulator_object<FILE_STANDARD_INFORMATION> info{c.emu, address};
+            FILE_STANDARD_INFORMATION i{};
+            i.Directory = f->is_directory() ? TRUE : FALSE;
+            i.NumberOfLinks = 1;
+
+            if (f->handle)
+            {
+                i.EndOfFile.QuadPart = f->handle.size();
+                i.AllocationSize.QuadPart = static_cast<LONGLONG>(align_up(i.EndOfFile.QuadPart, 512));
+            }
+
+            info.write(i);
+
+            if (!all_info)
+            {
+                return ret(STATUS_SUCCESS, required_length);
+            }
+
+            length -= required_length;
+            all_length += required_length;
+        }
+
+        if (info_class == FileInternalInformation || all_info)
+        {
+            const uint32_t required_length = sizeof(FILE_INTERNAL_INFORMATION);
+
+            if (length < required_length)
+            {
+                return ret(STATUS_INFO_LENGTH_MISMATCH);
+            }
+
+            struct compat_stat file_stat{};
+            if (f->handle && !compat_fstat(f->handle.file_descriptor(), &file_stat))
+            {
+                return STATUS_INVALID_HANDLE;
+            }
+
+            auto address = file_information;
+            if (all_info)
+            {
+                address += offsetof(FILE_ALL_INFORMATION, InternalInformation);
+            }
+
+            const emulator_object<FILE_INTERNAL_INFORMATION> info{c.emu, address};
+            FILE_INTERNAL_INFORMATION i{};
+
+            i.IndexNumber.QuadPart = static_cast<LONGLONG>(file_stat.st_ino);
+
+            info.write(i);
+
+            if (!all_info)
+            {
+                return ret(STATUS_SUCCESS, required_length);
+            }
+
+            length -= required_length;
+            all_length += required_length;
+        }
+
+        if (info_class == FileEaInformation || all_info)
+        {
+            constexpr auto required_length = sizeof(FILE_EA_INFORMATION);
+
+            if (length < required_length)
+            {
+                return ret(STATUS_INFO_LENGTH_MISMATCH);
+            }
+
+            auto address = file_information;
+            if (all_info)
+            {
+                address += offsetof(FILE_ALL_INFORMATION, EaInformation);
+            }
+            const emulator_object<FILE_EA_INFORMATION> info{c.emu, address};
+            FILE_EA_INFORMATION i{};
+
+            i.EaSize = 0;
+
+            info.write(i);
+
+            if (!all_info)
+            {
+                return ret(STATUS_SUCCESS, required_length);
+            }
+
+            length -= required_length;
+            all_length += required_length;
+        }
+
+        if (info_class == FileAccessInformation || all_info)
+        {
+            constexpr auto required_length = sizeof(FILE_ACCESS_INFORMATION);
+
+            if (length < required_length)
+            {
+                return ret(STATUS_INFO_LENGTH_MISMATCH);
+            }
+
+            auto address = file_information;
+            if (all_info)
+            {
+                address += offsetof(FILE_ALL_INFORMATION, AccessInformation);
+            }
+
+            const emulator_object<FILE_ACCESS_INFORMATION> info{c.emu, address};
+            FILE_ACCESS_INFORMATION i{};
+
+            i.AccessFlags = f->access_mask;
+
+            info.write(i);
+
+            if (!all_info)
+            {
+                return ret(STATUS_SUCCESS, required_length);
+            }
+
+            length -= required_length;
+            all_length += required_length;
+        }
+
+        if (info_class == FilePositionInformation || all_info)
+        {
+            constexpr auto required_length = sizeof(FILE_POSITION_INFORMATION);
+
+            if (length < required_length)
+            {
+                return ret(STATUS_INFO_LENGTH_MISMATCH);
+            }
+
+            auto address = file_information;
+            if (all_info)
+            {
+                address += offsetof(FILE_ALL_INFORMATION, PositionInformation);
+            }
+
+            const emulator_object<FILE_POSITION_INFORMATION> info{c.emu, address};
+            FILE_POSITION_INFORMATION i{};
+
+            i.CurrentByteOffset.QuadPart = f->handle ? f->handle.tell() : 0;
+
+            info.write(i);
+
+            if (!all_info)
+            {
+                return ret(STATUS_SUCCESS, required_length);
+            }
+
+            length -= required_length;
+            all_length += required_length;
+        }
+
+        if (info_class == FileModeInformation || all_info)
+        {
+            constexpr auto required_length = sizeof(FILE_MODE_INFORMATION);
+
+            if (length < required_length)
+            {
+                return ret(STATUS_INFO_LENGTH_MISMATCH);
+            }
+
+            auto address = file_information;
+            if (all_info)
+            {
+                address += offsetof(FILE_ALL_INFORMATION, ModeInformation);
+            }
+
+            const emulator_object<FILE_MODE_INFORMATION> info{c.emu, address};
+            FILE_MODE_INFORMATION i{};
+
+            i.Mode = f->file_mode;
+
+            info.write(i);
+
+            if (!all_info)
+            {
+                return ret(STATUS_SUCCESS, required_length);
+            }
+
+            length -= required_length;
+            all_length += required_length;
+        }
+
+        if (info_class == FileAlignmentInformation || all_info)
+        {
+            constexpr auto required_length = sizeof(FILE_ALIGNMENT_INFORMATION);
+
+            if (length < required_length)
+            {
+                return ret(STATUS_INFO_LENGTH_MISMATCH);
+            }
+
+            auto address = file_information;
+            if (all_info)
+            {
+                address += offsetof(FILE_ALL_INFORMATION, AlignmentInformation);
+            }
+
+            const emulator_object<FILE_ALIGNMENT_INFORMATION> info{c.emu, address};
+            FILE_ALIGNMENT_INFORMATION i{};
+
+            i.AlignmentRequirement = FILE_BYTE_ALIGNMENT;
+
+            info.write(i);
+
+            if (!all_info)
+            {
+                return ret(STATUS_SUCCESS, required_length);
+            }
+
+            length -= required_length;
+            all_length += required_length;
+        }
+
+        if (info_class == FileNameInformation || info_class == FileNormalizedNameInformation || all_info)
+        {
+            const auto relative_path = u"\\" + windows_path(f->name).without_drive().u16string();
+            const auto required_length = static_cast<uint32_t>((relative_path.size() * 2) + offsetof(FILE_NAME_INFORMATION, FileName));
+
+            if (length < sizeof(FILE_NAME_INFORMATION))
+            {
+                return ret(STATUS_INFO_LENGTH_MISMATCH);
+            }
+
+            const uint32_t copy_length = std::min(length, required_length) - offsetof(FILE_NAME_INFORMATION, FileName);
+
+            auto address = file_information;
+            if (all_info)
+            {
+                address += offsetof(FILE_ALL_INFORMATION, NameInformation);
+            }
+
+            c.emu.write_memory(address, FILE_NAME_INFORMATION{
+                                            .FileNameLength = static_cast<ULONG>(relative_path.size() * 2),
+                                            .FileName = {},
+                                        });
+
+            c.emu.write_memory(address + offsetof(FILE_NAME_INFORMATION, FileName), relative_path.c_str(), copy_length);
+
+            const uint32_t total_copied = copy_length + offsetof(FILE_NAME_INFORMATION, FileName);
+
+            if (!all_info)
+            {
+                return ret(total_copied == required_length ? STATUS_SUCCESS : STATUS_BUFFER_OVERFLOW, total_copied);
+            }
+
+            length -= total_copied;
+            all_length += total_copied;
+        }
+
+        if (all_info)
+        {
+            return ret(STATUS_SUCCESS, all_length);
+        }
+
+        c.win_emu.log.error("Unsupported query file info class: 0x%X\n", info_class);
         c.emu.stop();
 
         return ret(STATUS_NOT_SUPPORTED);
@@ -574,19 +1009,25 @@ namespace syscalls
                 return ret(status);
             }
 
-            struct _stat64 file_stat{};
-            if (fstat64(native_file_handle, &file_stat) != 0)
+            struct compat_stat file_stat{};
+            if (!compat_fstat(native_file_handle.file_descriptor(), &file_stat))
             {
                 return STATUS_INVALID_HANDLE;
             }
 
+            const auto is_directory = (file_stat.st_mode & S_IFDIR) != 0;
+
             EMU_FILE_STAT_BASIC_INFORMATION i{};
 
-            i.CreationTime = utils::convert_unix_to_windows_time(file_stat.st_atime);
-            i.LastAccessTime = utils::convert_unix_to_windows_time(file_stat.st_atime);
-            i.LastWriteTime = utils::convert_unix_to_windows_time(file_stat.st_mtime);
+            i.CreationTime = convert_timespec_to_filetime(file_stat.st_ctimespec);
+            i.LastAccessTime = convert_timespec_to_filetime(file_stat.st_atimespec);
+            i.LastWriteTime = convert_timespec_to_filetime(file_stat.st_mtimespec);
             i.ChangeTime = i.LastWriteTime;
-            i.FileAttributes = (file_stat.st_mode & S_IFDIR) != 0 ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+            i.FileAttributes = is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+
+            const auto file_size = is_directory ? 0LL : file_stat.st_size;
+            i.EndOfFile.QuadPart = file_size;
+            i.AllocationSize.QuadPart = static_cast<LONGLONG>(align_up(file_size, 512));
 
             c.emu.write_memory(file_information, i);
 
@@ -612,11 +1053,47 @@ namespace syscalls
         emu.write_memory(buffer, data.data(), data.size());
     }
 
+    void write_lock_io_status(const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const NTSTATUS status,
+                              const uint64_t information = 0)
+    {
+        if (!io_status_block)
+        {
+            return;
+        }
+
+        IO_STATUS_BLOCK<EmulatorTraits<Emu64>> block{};
+        block.Status = status;
+        block.Information = information;
+        io_status_block.write(block);
+    }
+
+    std::optional<uint64_t> get_lock_range_end(const LARGE_INTEGER& byte_offset, const LARGE_INTEGER& length)
+    {
+        if (byte_offset.QuadPart < 0 || length.QuadPart <= 0)
+        {
+            return std::nullopt;
+        }
+
+        const auto offset = static_cast<uint64_t>(byte_offset.QuadPart);
+        const auto range_length = static_cast<uint64_t>(length.QuadPart);
+        if (offset > std::numeric_limits<uint64_t>::max() - range_length)
+        {
+            return std::nullopt;
+        }
+
+        return offset + range_length;
+    }
+
+    bool does_lock_range_overlap(const file_lock_range& existing, const uint64_t offset, const uint64_t end)
+    {
+        const auto existing_end = existing.offset + existing.length;
+        return existing.offset < end && offset < existing_end;
+    }
+
     NTSTATUS handle_NtReadFile(const syscall_context& c, const handle file_handle, const uint64_t /*event*/, const uint64_t /*apc_routine*/,
                                const uint64_t /*apc_context*/,
                                const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const uint64_t buffer,
-                               const ULONG length, const emulator_object<LARGE_INTEGER> /*byte_offset*/,
-                               const emulator_object<ULONG> /*key*/)
+                               const ULONG length, const emulator_object<LARGE_INTEGER> byte_offset, const emulator_object<ULONG> /*key*/)
     {
         std::string temp_buffer{};
         temp_buffer.resize(length);
@@ -635,6 +1112,18 @@ namespace syscalls
             const auto count = std::max(read_count, static_cast<std::streamsize>(0));
 
             commit_file_data(std::string_view(temp_buffer.data(), static_cast<size_t>(count)), c.emu, io_status_block, buffer);
+            return STATUS_SUCCESS;
+        }
+
+        if (file_handle == NUL_HANDLE)
+        {
+            if (io_status_block)
+            {
+                IO_STATUS_BLOCK<EmulatorTraits<Emu64>> block{};
+                block.Information = 0;
+                io_status_block.write(block);
+            }
+
             return STATUS_SUCCESS;
         }
 
@@ -672,17 +1161,50 @@ namespace syscalls
             return STATUS_INVALID_HANDLE;
         }
 
-        const auto bytes_read = fread(temp_buffer.data(), 1, temp_buffer.size(), f->handle);
-        commit_file_data(std::string_view(temp_buffer.data(), bytes_read), c.emu, io_status_block, buffer);
+        if (byte_offset)
+        {
+            const auto offset = byte_offset.read();
+            const bool use_current_file_pointer = offset.LowPart == FILE_USE_FILE_POINTER_POSITION && offset.HighPart == -1;
 
-        return STATUS_SUCCESS;
+            if (!use_current_file_pointer)
+            {
+                if (offset.QuadPart < 0)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                if (!f->handle.seek_to(offset.QuadPart))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+            }
+        }
+
+        const auto bytes_read = fread(temp_buffer.data(), 1, temp_buffer.size(), f->handle);
+
+        if (bytes_read > 0)
+        {
+            commit_file_data(std::string_view(temp_buffer.data(), bytes_read), c.emu, io_status_block, buffer);
+            return STATUS_SUCCESS;
+        }
+
+        const auto status = length > 0 ? STATUS_END_OF_FILE : STATUS_SUCCESS;
+
+        if (io_status_block)
+        {
+            IO_STATUS_BLOCK<EmulatorTraits<Emu64>> block{};
+            block.Status = status;
+            block.Information = 0;
+            io_status_block.write(block);
+        }
+
+        return status;
     }
 
     NTSTATUS handle_NtWriteFile(const syscall_context& c, const handle file_handle, const uint64_t /*event*/,
                                 const uint64_t /*apc_routine*/, const uint64_t /*apc_context*/,
                                 const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const uint64_t buffer,
-                                const ULONG length, const emulator_object<LARGE_INTEGER> /*byte_offset*/,
-                                const emulator_object<ULONG> /*key*/)
+                                const ULONG length, const emulator_object<LARGE_INTEGER> byte_offset, const emulator_object<ULONG> /*key*/)
     {
         std::string temp_buffer{};
         temp_buffer.resize(length);
@@ -698,6 +1220,18 @@ namespace syscalls
             }
 
             c.win_emu.callbacks.on_stdout(temp_buffer);
+
+            return STATUS_SUCCESS;
+        }
+
+        if (file_handle == NUL_HANDLE)
+        {
+            if (io_status_block)
+            {
+                IO_STATUS_BLOCK<EmulatorTraits<Emu64>> block{};
+                block.Information = length;
+                io_status_block.write(block);
+            }
 
             return STATUS_SUCCESS;
         }
@@ -729,6 +1263,33 @@ namespace syscalls
             return STATUS_INVALID_HANDLE;
         }
 
+        if (byte_offset)
+        {
+            const auto offset = byte_offset.read();
+            const bool use_end_of_file = offset.LowPart == FILE_WRITE_TO_END_OF_FILE && offset.HighPart == -1;
+            const bool use_current_file_pointer = offset.LowPart == FILE_USE_FILE_POINTER_POSITION && offset.HighPart == -1;
+
+            if (use_end_of_file)
+            {
+                if (!f->handle.seek_to(0, SEEK_END))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+            }
+            else if (!use_current_file_pointer)
+            {
+                if (offset.QuadPart < 0)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                if (!f->handle.seek_to(offset.QuadPart))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+            }
+        }
+
         const auto bytes_written = fwrite(temp_buffer.data(), 1, temp_buffer.size(), f->handle);
 
         if (io_status_block)
@@ -741,51 +1302,172 @@ namespace syscalls
         return STATUS_SUCCESS;
     }
 
+    NTSTATUS handle_NtLockFile(const syscall_context& c, const handle file_handle, const handle /*event_handle*/,
+                               const uint64_t /*apc_routine*/, const uint64_t /*apc_context*/,
+                               const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
+                               const emulator_object<LARGE_INTEGER> byte_offset, const emulator_object<LARGE_INTEGER> length,
+                               const ULONG key, const BOOLEAN fail_immediately, const BOOLEAN exclusive_lock)
+    {
+        if (!io_status_block || !byte_offset || !length)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        const auto* f = c.proc.files.get(file_handle);
+        if (!f || !f->is_file())
+        {
+            write_lock_io_status(io_status_block, STATUS_INVALID_HANDLE);
+            return STATUS_INVALID_HANDLE;
+        }
+
+        const auto lock_offset = byte_offset.read();
+        const auto lock_length = length.read();
+        const auto lock_end = get_lock_range_end(lock_offset, lock_length);
+        if (!lock_end)
+        {
+            write_lock_io_status(io_status_block, STATUS_INVALID_LOCK_RANGE);
+            return STATUS_INVALID_LOCK_RANGE;
+        }
+
+        const auto offset = static_cast<uint64_t>(lock_offset.QuadPart);
+        const auto range_length = static_cast<uint64_t>(lock_length.QuadPart);
+        const auto is_exclusive = exclusive_lock != FALSE;
+        const auto lock_key = f->host_path.u16string();
+
+        if (const auto lock_it = c.proc.file_locks.find(lock_key); lock_it != c.proc.file_locks.end())
+        {
+            for (const auto& existing : lock_it->second.locks)
+            {
+                if (existing.owner == file_handle || !does_lock_range_overlap(existing, offset, *lock_end))
+                {
+                    continue;
+                }
+
+                if (!existing.exclusive && !is_exclusive)
+                {
+                    continue;
+                }
+
+                // Blocking lock completion is not modeled yet; surface the conflict immediately.
+                (void)fail_immediately;
+                write_lock_io_status(io_status_block, STATUS_LOCK_NOT_GRANTED);
+                return STATUS_LOCK_NOT_GRANTED;
+            }
+        }
+
+        c.proc.file_locks[lock_key].locks.push_back(file_lock_range{
+            .offset = offset,
+            .length = range_length,
+            .key = key,
+            .exclusive = is_exclusive,
+            .owner = file_handle,
+        });
+
+        write_lock_io_status(io_status_block, STATUS_SUCCESS);
+        return STATUS_SUCCESS;
+    }
+
+    NTSTATUS handle_NtUnlockFile(const syscall_context& c, const handle file_handle,
+                                 const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
+                                 const emulator_object<LARGE_INTEGER> byte_offset, const emulator_object<LARGE_INTEGER> length,
+                                 const ULONG key)
+    {
+        if (!io_status_block || !byte_offset || !length)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        const auto* f = c.proc.files.get(file_handle);
+        if (!f || !f->is_file())
+        {
+            write_lock_io_status(io_status_block, STATUS_INVALID_HANDLE);
+            return STATUS_INVALID_HANDLE;
+        }
+
+        const auto lock_offset = byte_offset.read();
+        const auto lock_length = length.read();
+        if (!get_lock_range_end(lock_offset, lock_length))
+        {
+            write_lock_io_status(io_status_block, STATUS_INVALID_LOCK_RANGE);
+            return STATUS_INVALID_LOCK_RANGE;
+        }
+
+        const auto offset = static_cast<uint64_t>(lock_offset.QuadPart);
+        const auto range_length = static_cast<uint64_t>(lock_length.QuadPart);
+        const auto lock_key = f->host_path.u16string();
+        const auto lock_it = c.proc.file_locks.find(lock_key);
+        if (lock_it == c.proc.file_locks.end())
+        {
+            write_lock_io_status(io_status_block, STATUS_RANGE_NOT_LOCKED);
+            return STATUS_RANGE_NOT_LOCKED;
+        }
+
+        auto& locks = lock_it->second.locks;
+        const auto entry = std::ranges::find_if(locks, [&](const file_lock_range& existing) {
+            return existing.owner == file_handle && existing.offset == offset && existing.length == range_length && existing.key == key;
+        });
+
+        if (entry == locks.end())
+        {
+            write_lock_io_status(io_status_block, STATUS_RANGE_NOT_LOCKED);
+            return STATUS_RANGE_NOT_LOCKED;
+        }
+
+        locks.erase(entry);
+        if (locks.empty())
+        {
+            c.proc.file_locks.erase(lock_it);
+        }
+
+        write_lock_io_status(io_status_block, STATUS_SUCCESS);
+        return STATUS_SUCCESS;
+    }
+
     constexpr std::u16string map_mode(const ACCESS_MASK desired_access, const ULONG create_disposition)
     {
-        std::u16string mode{};
+        const auto wants_write = (desired_access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA)) != 0;
+        const auto wants_read = (desired_access & (GENERIC_READ | FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE)) != 0;
+
+        if (desired_access & FILE_APPEND_DATA)
+        {
+            return u"a+b";
+        }
 
         switch (create_disposition)
         {
         case FILE_CREATE:
         case FILE_SUPERSEDE:
-            if (desired_access & GENERIC_WRITE)
+            if (wants_write)
             {
-                mode = u"wb";
+                return wants_read ? u"w+b" : u"wb";
             }
             break;
 
         case FILE_OPEN:
         case FILE_OPEN_IF:
-            if (desired_access & GENERIC_WRITE)
+            if (wants_write)
             {
-                mode = u"r+b";
+                return u"r+b";
             }
-            else if (desired_access & GENERIC_READ || desired_access & SYNCHRONIZE)
+            if (wants_read)
             {
-                mode = u"rb";
+                return u"rb";
             }
             break;
 
         case FILE_OVERWRITE:
         case FILE_OVERWRITE_IF:
-            if (desired_access & GENERIC_WRITE)
+            if (wants_write)
             {
-                mode = u"w+b";
+                return u"w+b";
             }
             break;
 
         default:
-            mode = u"";
             break;
         }
 
-        if (desired_access & FILE_APPEND_DATA)
-        {
-            mode = u"a+b";
-        }
-
-        return mode;
+        return {};
     }
 
     std::optional<std::u16string_view> get_io_device_name(const std::u16string_view filename)
@@ -850,8 +1532,43 @@ namespace syscalls
                                  ULONG /*share_access*/, ULONG create_disposition, ULONG create_options, uint64_t ea_buffer,
                                  ULONG ea_length)
     {
+        if (create_options & FILE_DELETE_ON_CLOSE && !(desired_access & DELETE))
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
         const auto attributes = object_attributes.read();
         auto filename = read_unicode_string(c.emu, attributes.ObjectName);
+
+        // Check for console device paths
+        // Convert to uppercase for case-insensitive comparison
+        std::u16string filename_upper = filename;
+        std::ranges::transform(filename_upper, filename_upper.begin(), ::towupper);
+
+        // Handle console output device
+        if (filename_upper == u"\\??\\CONOUT$" || filename_upper == u"\\DEVICE\\CONOUT$" || filename_upper == u"CONOUT$" ||
+            filename_upper == u"\\??\\CON" || filename_upper == u"\\DEVICE\\CONSOLE" || filename_upper == u"CON")
+        {
+            c.win_emu.callbacks.on_generic_access("Opening console output", filename);
+            file_handle.write(STDOUT_HANDLE);
+            return STATUS_SUCCESS;
+        }
+
+        // Handle console input device
+        if (filename_upper == u"\\??\\CONIN$" || filename_upper == u"\\DEVICE\\CONIN$" || filename_upper == u"CONIN$")
+        {
+            c.win_emu.callbacks.on_generic_access("Opening console input", filename);
+            file_handle.write(STDIN_HANDLE);
+            return STATUS_SUCCESS;
+        }
+
+        // Handle NUL device
+        if (filename_upper == u"\\??\\NUL" || filename_upper == u"NUL")
+        {
+            c.win_emu.callbacks.on_generic_access("Opening NUL", filename);
+            file_handle.write(NUL_HANDLE);
+            return STATUS_SUCCESS;
+        }
 
         if (is_named_pipe_path(filename))
         {
@@ -886,7 +1603,15 @@ namespace syscalls
             return STATUS_SUCCESS;
         }
 
+        if (filename == u"\\??\\CONOUT$")
+        {
+            file_handle.write(STDOUT_HANDLE);
+            return STATUS_SUCCESS;
+        }
+
         file f{};
+        f.access_mask = desired_access;
+        f.file_mode = create_options & FILE_MODE_MASK;
         f.name = std::move(filename);
 
         if (attributes.RootDirectory)
@@ -906,25 +1631,71 @@ namespace syscalls
         std::error_code ec{};
 
         const windows_path path = f.name;
-        const bool is_directory = std::filesystem::is_directory(c.win_emu.file_sys.translate(path), ec);
 
-        if (is_directory || create_options & FILE_DIRECTORY_FILE)
+        if (!path.is_absolute())
+        {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+
+        f.drive_number = path.get_drive().value() - 'a' + 1;
+
+        const auto host_path = c.win_emu.file_sys.translate(path);
+        const bool file_exists = std::filesystem::exists(host_path, ec);
+
+        if (file_exists && std::filesystem::is_directory(host_path, ec))
+        {
+            if (create_options & FILE_NON_DIRECTORY_FILE)
+            {
+                return STATUS_FILE_IS_A_DIRECTORY;
+            }
+
+            if (create_disposition == FILE_CREATE)
+            {
+                return STATUS_OBJECT_NAME_COLLISION;
+            }
+
+            if (create_disposition != FILE_OPEN && create_disposition != FILE_OPEN_IF)
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+
+            c.win_emu.callbacks.on_generic_access("Opening folder", f.name);
+
+            f.host_path = host_path;
+
+            const auto handle = c.proc.files.store(std::move(f));
+            file_handle.write(handle);
+
+            return STATUS_SUCCESS;
+        }
+
+        if (create_options & FILE_DIRECTORY_FILE)
         {
             c.win_emu.callbacks.on_generic_access("Opening folder", f.name);
 
-            if (create_disposition & FILE_CREATE)
+            if (file_exists)
             {
-                create_directory(c.win_emu.file_sys.translate(path), ec);
-
-                if (ec)
-                {
-                    return STATUS_ACCESS_DENIED;
-                }
+                return STATUS_NOT_A_DIRECTORY;
             }
-            else if (!is_directory)
+
+            if (create_disposition != FILE_CREATE && create_disposition != FILE_OPEN_IF)
             {
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
+
+            if (!std::filesystem::is_directory(host_path.parent_path(), ec))
+            {
+                return STATUS_OBJECT_PATH_NOT_FOUND;
+            }
+
+            create_directory(host_path, ec);
+
+            if (ec)
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+
+            f.host_path = host_path;
 
             const auto handle = c.proc.files.store(std::move(f));
             file_handle.write(handle);
@@ -934,7 +1705,42 @@ namespace syscalls
 
         c.win_emu.callbacks.on_generic_access("Opening file", f.name);
 
+        if (create_disposition == FILE_CREATE && file_exists)
+        {
+            return STATUS_OBJECT_NAME_COLLISION;
+        }
+
+        if ((create_disposition == FILE_OVERWRITE || create_disposition == FILE_OPEN) && !file_exists)
+        {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+
+        if (create_disposition == FILE_OPEN_IF && !file_exists)
+        {
+            std::ofstream touch(host_path, std::ios::binary | std::ios::app);
+            if (!touch)
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+        }
+
         std::u16string mode = map_mode(desired_access, create_disposition);
+
+        if (mode.empty() && create_disposition == FILE_CREATE)
+        {
+            std::ofstream touch(host_path, std::ios::binary | std::ios::app);
+            if (!touch)
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+
+            mode = u"rb";
+        }
+
+        if (mode.empty() && (desired_access & DELETE))
+        {
+            mode = u"rb";
+        }
 
         if (mode.empty() || path.is_relative())
         {
@@ -948,6 +1754,13 @@ namespace syscalls
         }
 
         f.handle = std::move(native_file_handle);
+        f.open_mode = mode;
+        f.host_path = host_path;
+
+        if (create_options & FILE_DELETE_ON_CLOSE)
+        {
+            f.handle.defer_delete(host_path);
+        }
 
         const auto handle = c.proc.files.store(std::move(f));
         file_handle.write(handle);
@@ -988,18 +1801,18 @@ namespace syscalls
 
         const auto local_filename = c.win_emu.file_sys.translate(filename).u8string();
 
-        struct _stat64 file_stat{};
-        if (_stat64(reinterpret_cast<const char*>(local_filename.c_str()), &file_stat) != 0)
+        struct compat_stat file_stat{};
+        if (!compat_stat(reinterpret_cast<const char*>(local_filename.c_str()), &file_stat))
         {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         }
 
         file_information.access([&](FILE_NETWORK_OPEN_INFORMATION& info) {
-            info.CreationTime = utils::convert_unix_to_windows_time(file_stat.st_atime);
-            info.LastAccessTime = utils::convert_unix_to_windows_time(file_stat.st_atime);
-            info.LastWriteTime = utils::convert_unix_to_windows_time(file_stat.st_mtime);
-            info.AllocationSize.QuadPart = file_stat.st_size;
-            info.EndOfFile.QuadPart = file_stat.st_size;
+            info.CreationTime = convert_timespec_to_filetime(file_stat.st_ctimespec);
+            info.LastAccessTime = convert_timespec_to_filetime(file_stat.st_atimespec);
+            info.LastWriteTime = convert_timespec_to_filetime(file_stat.st_mtimespec);
+            info.AllocationSize.QuadPart = static_cast<LONGLONG>(file_stat.st_size);
+            info.EndOfFile.QuadPart = static_cast<LONGLONG>(file_stat.st_size);
             info.ChangeTime = info.LastWriteTime;
             info.FileAttributes = (file_stat.st_mode & S_IFDIR) != 0 ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
         });
@@ -1022,8 +1835,19 @@ namespace syscalls
             return STATUS_INVALID_PARAMETER;
         }
 
-        const auto filename =
-            read_unicode_string(c.emu, emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>>{c.emu, attributes.ObjectName});
+        auto filename = read_unicode_string(c.emu, emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>>{c.emu, attributes.ObjectName});
+
+        if (attributes.RootDirectory)
+        {
+            const auto* root = c.proc.files.get(attributes.RootDirectory);
+            if (!root)
+            {
+                return STATUS_INVALID_HANDLE;
+            }
+
+            const auto has_separator = root->name.ends_with(u"\\") || root->name.ends_with(u"/");
+            filename = root->name + (has_separator ? u"" : u"\\") + filename;
+        }
 
         c.win_emu.callbacks.on_generic_access("Querying file attributes", filename);
 
@@ -1035,16 +1859,16 @@ namespace syscalls
 
         const auto local_filename = c.win_emu.file_sys.translate(filepath).u8string();
 
-        struct _stat64 file_stat{};
-        if (_stat64(reinterpret_cast<const char*>(local_filename.c_str()), &file_stat) != 0)
+        struct compat_stat file_stat{};
+        if (!compat_stat(reinterpret_cast<const char*>(local_filename.c_str()), &file_stat))
         {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         }
 
         file_information.access([&](FILE_BASIC_INFORMATION& info) {
-            info.CreationTime = utils::convert_unix_to_windows_time(file_stat.st_atime);
-            info.LastAccessTime = utils::convert_unix_to_windows_time(file_stat.st_atime);
-            info.LastWriteTime = utils::convert_unix_to_windows_time(file_stat.st_mtime);
+            info.CreationTime = convert_timespec_to_filetime(file_stat.st_ctimespec);
+            info.LastAccessTime = convert_timespec_to_filetime(file_stat.st_atimespec);
+            info.LastWriteTime = convert_timespec_to_filetime(file_stat.st_mtimespec);
             info.ChangeTime = info.LastWriteTime;
             info.FileAttributes = (file_stat.st_mode & S_IFDIR) != 0 ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
         });
@@ -1074,6 +1898,12 @@ namespace syscalls
             return STATUS_SUCCESS;
         }
 
+        if (object_name == u"\\KnownDlls32")
+        {
+            directory_handle.write(KNOWN_DLLS32_DIRECTORY);
+            return STATUS_SUCCESS;
+        }
+
         if (object_name == u"\\Sessions\\1\\BaseNamedObjects")
         {
             directory_handle.write(BASE_NAMED_OBJECTS_DIRECTORY);
@@ -1084,6 +1914,20 @@ namespace syscalls
         {
             directory_handle.write(RPC_CONTROL_DIRECTORY);
             return STATUS_SUCCESS;
+        }
+
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    NTSTATUS handle_NtCreateDirectoryObject(const syscall_context& /*c*/, const emulator_object<handle> /*directory_handle*/,
+                                            const ACCESS_MASK /*desired_access*/,
+                                            const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes)
+    {
+        const auto attributes = object_attributes.read();
+
+        if (attributes.ObjectName == 0)
+        {
+            return STATUS_INVALID_PARAMETER;
         }
 
         return STATUS_NOT_SUPPORTED;
@@ -1109,11 +1953,9 @@ namespace syscalls
                                               const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> link_target,
                                               const emulator_object<ULONG> returned_length)
     {
-        if (link_handle == KNOWN_DLLS_SYMLINK)
-        {
-            constexpr std::u16string_view system32 = u"C:\\WINDOWS\\System32";
-            constexpr auto str_length = system32.size() * 2;
-            constexpr auto max_length = str_length + 2;
+        auto write_target = [&](const std::u16string& target) -> NTSTATUS {
+            const auto str_length = static_cast<uint16_t>(target.size() * sizeof(char16_t));
+            const auto max_length = static_cast<ULONG>(str_length + sizeof(char16_t));
 
             returned_length.write(max_length);
 
@@ -1126,10 +1968,22 @@ namespace syscalls
                 }
 
                 str.Length = str_length;
-                c.emu.write_memory(str.Buffer, system32.data(), max_length);
+                c.emu.write_memory(str.Buffer, target.data(), max_length);
             });
 
             return too_small ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
+        };
+
+        const auto& system_root = c.win_emu.version.get_system_root();
+
+        if (link_handle == KNOWN_DLLS_SYMLINK)
+        {
+            return write_target((system_root / "System32").u16string());
+        }
+
+        if (link_handle == KNOWN_DLLS32_SYMLINK)
+        {
+            return write_target((system_root / "SysWOW64").u16string());
         }
 
         return STATUS_NOT_SUPPORTED;

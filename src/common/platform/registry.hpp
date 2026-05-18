@@ -1,6 +1,6 @@
 #pragma once
 
-// NOLINTBEGIN(modernize-use-using,cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
+// NOLINTBEGIN(modernize-use-using,cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-use-enum-class)
 
 typedef enum _KEY_INFORMATION_CLASS
 {
@@ -16,6 +16,18 @@ typedef enum _KEY_INFORMATION_CLASS
     KeyLayerInformation,          // KEY_LAYER_INFORMATION
     MaxKeyInfoClass
 } KEY_INFORMATION_CLASS;
+
+enum KEY_SET_INFORMATION_CLASS
+{
+    KeyWriteTimeInformation,         // KEY_WRITE_TIME_INFORMATION
+    KeyWow64FlagsInformation,        // KEY_WOW64_FLAGS_INFORMATION
+    KeyControlFlagsInformation,      // KEY_CONTROL_FLAGS_INFORMATION
+    KeySetVirtualizationInformation, // KEY_SET_VIRTUALIZATION_INFORMATION
+    KeySetDebugInformation,          // KEY_SET_DEBUG_INFORMATION
+    KeySetHandleTagsInformation,     // KEY_HANDLE_TAGS_INFORMATION
+    KeySetLayerInformation,          // KEY_SET_LAYER_INFORMATION
+    MaxKeySetInfoClass
+};
 
 typedef enum _KEY_VALUE_INFORMATION_CLASS
 {
@@ -67,6 +79,18 @@ typedef struct _KEY_FULL_INFORMATION
     char16_t Class[1];
 } KEY_FULL_INFORMATION, *PKEY_FULL_INFORMATION;
 
+typedef struct _KEY_CACHED_INFORMATION
+{
+    LARGE_INTEGER LastWriteTime;
+    ULONG TitleIndex;
+    ULONG SubKeys;
+    ULONG MaxNameLen;
+    ULONG Values;
+    ULONG MaxValueNameLen;
+    ULONG MaxValueDataLen;
+    ULONG NameLength;
+} KEY_CACHED_INFORMATION, *PKEY_CACHED_INFORMATION;
+
 struct KEY_HANDLE_TAGS_INFORMATION
 {
     ULONG HandleTags;
@@ -98,4 +122,12 @@ struct KEY_VALUE_FULL_INFORMATION
     char16_t Name[1];
 };
 
-// NOLINTEND(modernize-use-using,cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
+struct KEY_VALUE_ENTRY
+{
+    EmulatorTraits<Emu64>::PVOID ValueName;
+    ULONG DataLength;
+    ULONG DataOffset;
+    ULONG Type;
+};
+
+// NOLINTEND(modernize-use-using,cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-use-enum-class)

@@ -6,6 +6,7 @@
 
 #include <utils/moved_marker.hpp>
 
+struct completion_state;
 struct process_context;
 
 struct pending_apc
@@ -35,6 +36,159 @@ struct pending_apc
     }
 };
 
+struct pending_msg
+{
+    emulator_object<msg> message;
+    hwnd hwnd_filter{};
+    UINT filter_min{};
+    UINT filter_max{};
+
+    pending_msg(memory_interface& memory)
+        : message(memory)
+    {
+    }
+
+    pending_msg(emulator_object<msg> message, hwnd hwnd_filter, UINT filter_min, UINT filter_max)
+        : message(message),
+          hwnd_filter(hwnd_filter),
+          filter_min(filter_min),
+          filter_max(filter_max)
+    {
+    }
+
+    void serialize(utils::buffer_serializer& buffer) const
+    {
+        buffer.write(this->message);
+        buffer.write(this->hwnd_filter);
+        buffer.write(this->filter_min);
+        buffer.write(this->filter_max);
+    }
+
+    void deserialize(utils::buffer_deserializer& buffer)
+    {
+        buffer.read(this->message);
+        buffer.read(this->hwnd_filter);
+        buffer.read(this->filter_min);
+        buffer.read(this->filter_max);
+    }
+};
+
+enum class io_completion_wait_type : uint8_t
+{
+    remove_single = 0,
+    remove_multiple = 1,
+};
+
+struct pending_io_completion_wait
+{
+    handle io_completion_handle{};
+    io_completion_wait_type type{io_completion_wait_type::remove_single};
+    emulator_pointer key_context_ptr{};
+    emulator_pointer apc_context_ptr{};
+    emulator_pointer io_status_block_ptr{};
+    emulator_pointer completion_entries_ptr{};
+    emulator_pointer entries_removed_ptr{};
+    ULONG max_entries{};
+    std::optional<std::chrono::steady_clock::time_point> timeout{};
+
+    void serialize(utils::buffer_serializer& buffer) const
+    {
+        buffer.write(static_cast<uint8_t>(this->type));
+        buffer.write(this->io_completion_handle);
+        buffer.write(this->key_context_ptr);
+        buffer.write(this->apc_context_ptr);
+        buffer.write(this->io_status_block_ptr);
+        buffer.write(this->completion_entries_ptr);
+        buffer.write(this->entries_removed_ptr);
+        buffer.write(this->max_entries);
+        buffer.write_optional(this->timeout);
+    }
+
+    void deserialize(utils::buffer_deserializer& buffer)
+    {
+        const auto raw_type = buffer.read<uint8_t>();
+        this->type = static_cast<io_completion_wait_type>(raw_type);
+        buffer.read(this->io_completion_handle);
+        buffer.read(this->key_context_ptr);
+        buffer.read(this->apc_context_ptr);
+        buffer.read(this->io_status_block_ptr);
+        buffer.read(this->completion_entries_ptr);
+        buffer.read(this->entries_removed_ptr);
+        buffer.read(this->max_entries);
+        buffer.read_optional(this->timeout);
+    }
+};
+
+enum class callback_id : uint32_t
+{
+    Invalid = 0,
+    NtUserCreateWindowEx,
+    NtUserDestroyWindow,
+    NtUserShowWindow,
+    NtUserMessageCall,
+    NtUserEnumDisplayMonitors,
+};
+
+enum class wow64_callback_postprocess : uint8_t
+{
+    none = 0,
+    bool_result_to_status = 1,
+};
+
+struct pending_wow64_callback
+{
+    uint32_t callback_id{};
+    wow64_callback_postprocess postprocess{wow64_callback_postprocess::none};
+
+    void serialize(utils::buffer_serializer& buffer) const
+    {
+        buffer.write(this->callback_id);
+        buffer.write(static_cast<uint8_t>(this->postprocess));
+    }
+
+    void deserialize(utils::buffer_deserializer& buffer)
+    {
+        buffer.read(this->callback_id);
+        this->postprocess = static_cast<wow64_callback_postprocess>(buffer.read<uint8_t>());
+    }
+};
+
+struct callback_frame
+{
+    callback_id handler_id{};
+    uint64_t rip{};
+    uint64_t rsp{};
+    uint64_t r10{};
+    uint64_t rcx{};
+    uint64_t rdx{};
+    uint64_t r8{};
+    uint64_t r9{};
+    uint16_t cs{};
+    uint16_t ss{};
+    uint16_t ds{};
+    uint16_t es{};
+    uint16_t fs{};
+    uint16_t gs{};
+    std::unique_ptr<completion_state> state{};
+
+    callback_frame();
+    callback_frame(callback_id callback_id, std::unique_ptr<completion_state> completion_state);
+
+    callback_frame(const callback_frame&) = delete;
+    callback_frame& operator=(const callback_frame&) = delete;
+
+    callback_frame(callback_frame&& obj) noexcept;
+    callback_frame& operator=(callback_frame&& obj) noexcept;
+
+    ~callback_frame();
+
+    void save_registers(x86_64_emulator& emu);
+    void restore_registers(x86_64_emulator& emu) const;
+
+    void serialize(utils::buffer_serializer& buffer) const;
+    void deserialize(utils::buffer_deserializer& buffer);
+};
+
 class emulator_thread : public ref_counted_object
 {
   public:
@@ -49,7 +203,7 @@ class emulator_thread : public ref_counted_object
     }
 
     emulator_thread(memory_manager& memory, const process_context& context, uint64_t start_address, uint64_t argument, uint64_t stack_size,
-                    bool suspended, uint32_t id);
+                    uint32_t create_flags, uint32_t id, bool initial_thread);
 
     emulator_thread(const emulator_thread&) = delete;
     emulator_thread& operator=(const emulator_thread&) = delete;
@@ -66,11 +220,14 @@ class emulator_thread : public ref_counted_object
 
     memory_manager* memory_ptr{};
 
-    uint64_t stack_base{};
-    uint64_t stack_size{};
+    uint64_t stack_base{};                    // Native 64-bit stack base
+    uint64_t stack_size{};                    // Native 64-bit stack size
+    std::optional<uint64_t> wow64_stack_base; // WOW64 32-bit stack base
+    std::optional<uint64_t> wow64_stack_size; // WOW64 32-bit stack size
     uint64_t start_address{};
     uint64_t argument{};
     uint64_t executed_instructions{0};
+    bool setup_done{false};
 
     uint32_t id{};
 
@@ -84,25 +241,49 @@ class emulator_thread : public ref_counted_object
     bool await_any{false};
     bool waiting_for_alert{false};
     bool alerted{false};
+    uint32_t create_flags{0};
     uint32_t suspended{0};
     std::optional<std::chrono::steady_clock::time_point> await_time{};
+    std::optional<pending_msg> await_msg{};
+    std::optional<pending_io_completion_wait> await_io_completion{};
 
     bool apc_alertable{false};
     std::vector<pending_apc> pending_apcs{};
 
     std::optional<NTSTATUS> pending_status{};
 
+    uint64_t win32k_thread_info{0};
+    handle win32k_desktop{};
+    uint64_t win32k_callback_buffer{0};
+    std::optional<pending_wow64_callback> win32k_pending_wow64_callback{};
+    bool win32k_thread_setup_pending{false};
+    bool win32k_thread_setup_done{false};
+
     std::optional<emulator_allocator> gs_segment;
-    std::optional<emulator_object<TEB64>> teb;
+    std::optional<emulator_object<TEB64>> teb64;                          // Native 64-bit TEB
+    std::optional<emulator_object<TEB32>> teb32;                          // WOW64 32-bit TEB
+    std::optional<emulator_allocator> wow64_context_segment;              // For WOW64 context (CONTEXT64) allocation
+    std::optional<emulator_object<WOW64_CPURESERVED>> wow64_cpu_reserved; // Persistent WOW64 thread context for ThreadWow64Context queries
 
     std::vector<std::byte> last_registers{};
+
+    bool debugger_hide{false};
+
+    std::vector<callback_frame> callback_stack;
+    std::optional<uint64_t> callback_return_rax{};
+
+    std::vector<msg> message_queue;
 
     void mark_as_ready(NTSTATUS status);
 
     bool is_await_time_over(utils::clock& clock) const
     {
-        return this->await_time.has_value() && this->await_time.value() < clock.steady_now();
+        constexpr auto infinite = std::chrono::steady_clock::time_point::min();
+        return this->await_time.has_value() && this->await_time.value() != infinite && this->await_time.value() < clock.steady_now();
     }
+
+    std::optional<msg> peek_pending_message(hwnd hwnd_filter, UINT filter_min, UINT filter_max, bool remove = false);
+    void post_message(const msg& msg);
 
     bool is_terminated() const;
 
@@ -116,12 +297,14 @@ class emulator_thread : public ref_counted_object
     void restore(x86_64_emulator& emu) const
     {
         emu.restore_registers(this->last_registers);
+        this->refresh_execution_context(emu);
     }
 
     void setup_if_necessary(x86_64_emulator& emu, const process_context& context)
     {
-        if (!this->executed_instructions)
+        if (!this->setup_done)
         {
+            this->setup_done = true;
             this->setup_registers(emu, context);
         }
 
@@ -146,6 +329,7 @@ class emulator_thread : public ref_counted_object
         buffer.write(this->start_address);
         buffer.write(this->argument);
         buffer.write(this->executed_instructions);
+        buffer.write(this->setup_done);
         buffer.write(this->id);
         buffer.write(this->current_ip);
         buffer.write(this->previous_ip);
@@ -159,17 +343,38 @@ class emulator_thread : public ref_counted_object
         buffer.write(this->waiting_for_alert);
         buffer.write(this->alerted);
 
+        buffer.write(this->create_flags);
         buffer.write(this->suspended);
         buffer.write_optional(this->await_time);
+        buffer.write_optional(this->await_msg);
+        buffer.write_optional(this->await_io_completion);
 
         buffer.write(this->apc_alertable);
         buffer.write_vector(this->pending_apcs);
 
         buffer.write_optional(this->pending_status);
+        buffer.write(this->win32k_thread_info);
+        buffer.write(this->win32k_desktop);
+        buffer.write(this->win32k_callback_buffer);
+        buffer.write_optional(this->win32k_pending_wow64_callback);
+        buffer.write(this->win32k_thread_setup_pending);
+        buffer.write(this->win32k_thread_setup_done);
         buffer.write_optional(this->gs_segment);
-        buffer.write_optional(this->teb);
+        buffer.write_optional(this->teb64);
+        buffer.write_optional(this->wow64_stack_base);
+        buffer.write_optional(this->wow64_stack_size);
+        buffer.write_optional(this->teb32);
+        buffer.write_optional(this->wow64_context_segment);
+        buffer.write_optional(this->wow64_cpu_reserved);
 
         buffer.write_vector(this->last_registers);
+
+        buffer.write(this->debugger_hide);
+
+        buffer.write_vector(this->callback_stack);
+        buffer.write_optional(this->callback_return_rax);
+
+        buffer.write_vector(this->message_queue);
     }
 
     void deserialize_object(utils::buffer_deserializer& buffer) override
@@ -186,6 +391,7 @@ class emulator_thread : public ref_counted_object
         buffer.read(this->start_address);
         buffer.read(this->argument);
         buffer.read(this->executed_instructions);
+        buffer.read(this->setup_done);
         buffer.read(this->id);
         buffer.read(this->current_ip);
         buffer.read(this->previous_ip);
@@ -199,17 +405,38 @@ class emulator_thread : public ref_counted_object
         buffer.read(this->waiting_for_alert);
         buffer.read(this->alerted);
 
+        buffer.read(this->create_flags);
         buffer.read(this->suspended);
         buffer.read_optional(this->await_time);
+        buffer.read_optional(this->await_msg, [this] { return pending_msg{*this->memory_ptr}; });
+        buffer.read_optional(this->await_io_completion, [] { return pending_io_completion_wait{}; });
 
         buffer.read(this->apc_alertable);
         buffer.read_vector(this->pending_apcs);
 
         buffer.read_optional(this->pending_status);
+        buffer.read(this->win32k_thread_info);
+        buffer.read(this->win32k_desktop);
+        buffer.read(this->win32k_callback_buffer);
+        buffer.read_optional(this->win32k_pending_wow64_callback, [] { return pending_wow64_callback{}; });
+        buffer.read(this->win32k_thread_setup_pending);
+        buffer.read(this->win32k_thread_setup_done);
         buffer.read_optional(this->gs_segment, [this] { return emulator_allocator(*this->memory_ptr); });
-        buffer.read_optional(this->teb, [this] { return emulator_object<TEB64>(*this->memory_ptr); });
+        buffer.read_optional(this->teb64, [this] { return emulator_object<TEB64>(*this->memory_ptr); });
+        buffer.read_optional(this->wow64_stack_base);
+        buffer.read_optional(this->wow64_stack_size);
+        buffer.read_optional(this->teb32, [this] { return emulator_object<TEB32>(*this->memory_ptr); });
+        buffer.read_optional(this->wow64_context_segment, [this] { return emulator_allocator(*this->memory_ptr); });
+        buffer.read_optional(this->wow64_cpu_reserved, [this] { return emulator_object<WOW64_CPURESERVED>(*this->memory_ptr); });
 
         buffer.read_vector(this->last_registers);
+
+        buffer.read(this->debugger_hide);
+
+        buffer.read_vector(this->callback_stack);
+        buffer.read_optional(this->callback_return_rax);
+
+        buffer.read_vector(this->message_queue);
     }
 
     void leak_memory()
@@ -224,6 +451,7 @@ class emulator_thread : public ref_counted_object
 
   private:
     void setup_registers(x86_64_emulator& emu, const process_context& context) const;
+    void refresh_execution_context(x86_64_emulator& emu) const;
 
     void release()
     {

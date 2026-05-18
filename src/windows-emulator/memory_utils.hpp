@@ -31,6 +31,10 @@ inline std::optional<nt_memory_permission> try_map_nt_to_emulator_protection(uin
         ext = memory_permission_ext::guard;
     }
 
+    // Remove the highest nibble since we are not currently handling those memory protection constants
+    // https://github.com/winsiderss/phnt/blob/master/ntmmapi.h#L26
+    nt_protection &= ~0xF0000000;
+
     memory_permission common = memory_permission::none;
     switch (nt_protection)
     {
@@ -51,8 +55,10 @@ inline std::optional<nt_memory_permission> try_map_nt_to_emulator_protection(uin
     case PAGE_EXECUTE_READWRITE:
         common = memory_permission::all;
         break;
-    case 0:
     case PAGE_EXECUTE_WRITECOPY:
+        common = memory_permission::all;
+        break;
+    case 0:
     default:
         return std::nullopt;
     }

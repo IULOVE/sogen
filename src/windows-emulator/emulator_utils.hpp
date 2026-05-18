@@ -6,8 +6,10 @@
 #include "memory_utils.hpp"
 #include "address_utils.hpp"
 #include "x86_register.hpp"
+#include "common/segment_utils.hpp"
 
 #include <utils/time.hpp>
+#include <vector>
 
 namespace network
 {
@@ -81,6 +83,11 @@ class emulator_object
     {
     }
 
+    emulator_object(utils::buffer_deserializer& buffer)
+        : emulator_object(buffer.read<memory_manager_wrapper>().get())
+    {
+    }
+
     uint64_t value() const
     {
         return this->address_;
@@ -101,11 +108,26 @@ class emulator_object
         return this->address_ != 0;
     }
 
+    std::optional<T> try_read(const size_t index = 0) const
+    {
+        T obj{};
+        if (this->memory_->try_read_memory(this->address_ + index * this->size(), &obj, sizeof(obj)))
+        {
+            return obj;
+        }
+        return std::nullopt;
+    }
+
     T read(const size_t index = 0) const
     {
         T obj{};
         this->memory_->read_memory(this->address_ + index * this->size(), &obj, sizeof(obj));
         return obj;
+    }
+
+    bool try_write(const T& value, const size_t index = 0) const
+    {
+        return this->memory_->try_write_memory(this->address_ + index * this->size(), &value, sizeof(value));
     }
 
     void write(const T& value, const size_t index = 0) const
@@ -182,6 +204,14 @@ class emulator_object
     }
 };
 
+enum class function_calling_convention
+{
+    x86_cdecl,
+    x86_stdcall,
+    x64_fastcall,
+    x64_syscall,
+};
+
 // TODO: warning emulator_utils is hardcoded for 64bit unicode_string usage
 class emulator_allocator
 {
@@ -222,6 +252,14 @@ class emulator_allocator
         return emulator_object<T>(*this->memory_, potential_start);
     }
 
+    template <typename T>
+    emulator_object<T> reserve_page_aligned(const size_t count = 1)
+    {
+        constexpr auto page_aligned_size = page_align_up(sizeof(T));
+        const auto potential_start = this->reserve(page_aligned_size * count, 0x1000);
+        return emulator_object<T>(*this->memory_, potential_start);
+    }
+
     uint64_t copy_string(const std::u16string_view str)
     {
         UNICODE_STRING<EmulatorTraits<Emu64>> uc_str{};
@@ -229,7 +267,8 @@ class emulator_allocator
         return uc_str.Buffer;
     }
 
-    void make_unicode_string(UNICODE_STRING<EmulatorTraits<Emu64>>& result, const std::u16string_view str,
+    template <typename EMU = Emu64>
+    void make_unicode_string(UNICODE_STRING<EmulatorTraits<EMU>>& result, const std::u16string_view str,
                              const std::optional<size_t> maximum_length = std::nullopt)
     {
         constexpr auto element_size = sizeof(str[0]);
@@ -246,13 +285,14 @@ class emulator_allocator
         constexpr std::array<char, element_size> nullbyte{};
         this->memory_->write_memory(string_buffer + total_length, nullbyte.data(), nullbyte.size());
 
-        result.Buffer = string_buffer;
+        result.Buffer = static_cast<EmulatorTraits<EMU>::PVOID>(string_buffer);
         result.Length = static_cast<USHORT>(total_length);
         result.MaximumLength = static_cast<USHORT>(max_length);
     }
 
-    emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> make_unicode_string(const std::u16string_view str,
-                                                                               const std::optional<size_t> maximum_length = std::nullopt)
+    template <typename EMU = Emu64>
+    emulator_object<UNICODE_STRING<EmulatorTraits<EMU>>> make_unicode_string(const std::u16string_view str,
+                                                                             const std::optional<size_t> maximum_length = std::nullopt)
     {
         const auto unicode_string = this->reserve<UNICODE_STRING<EmulatorTraits<Emu64>>>();
 
@@ -308,6 +348,16 @@ class emulator_allocator
         }
     }
 
+    void skip(const uint64_t bytes)
+    {
+        this->active_address_ += bytes;
+    }
+
+    void skip_until(const uint64_t offset)
+    {
+        this->active_address_ = this->address_ + offset;
+    }
+
   private:
     memory_interface* memory_{};
     uint64_t address_{};
@@ -356,23 +406,41 @@ inline std::u16string read_unicode_string(const emulator& emu, const UNICODE_STR
     return result;
 }
 
-inline std::u16string read_unicode_string(const emulator& emu, const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> uc_string)
+inline std::u16string read_unicode_string(const emulator& emu, const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> uc_string,
+                                          const size_t index = 0)
 {
-    const auto ucs = uc_string.read();
+    const auto ucs = uc_string.read(index);
     return read_unicode_string(emu, ucs);
 }
 
-inline std::u16string read_unicode_string(emulator& emu, const uint64_t uc_string)
+inline std::u16string read_unicode_string(emulator& emu, const uint64_t uc_string, const size_t index = 0)
 {
-    return read_unicode_string(emu, emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>>{emu, uc_string});
+    return read_unicode_string(emu, emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>>{emu, uc_string}, index);
 }
 
-inline uint64_t get_function_argument(x86_64_emulator& emu, const size_t index, const bool is_syscall = false)
+inline std::u16string read_large_string(const emulator_object<LARGE_STRING> str_obj, const size_t index = 0)
+{
+    if (!str_obj)
+    {
+        return {};
+    }
+
+    const auto str = str_obj.read(index);
+    if (!str.bAnsi)
+    {
+        return read_string<char16_t>(*str_obj.get_memory_interface(), str.Buffer, str.Length / 2);
+    }
+
+    const auto ansi_string = read_string<char>(*str_obj.get_memory_interface(), str.Buffer, str.Length);
+    return u8_to_u16(ansi_string);
+}
+
+inline uint64_t get_function_argument_x64_fastcall(x86_64_emulator& emu, const size_t index)
 {
     switch (index)
     {
     case 0:
-        return emu.reg(is_syscall ? x86_register::r10 : x86_register::rcx);
+        return emu.reg(x86_register::rcx);
     case 1:
         return emu.reg(x86_register::rdx);
     case 2:
@@ -382,4 +450,167 @@ inline uint64_t get_function_argument(x86_64_emulator& emu, const size_t index, 
     default:
         return emu.read_stack(index + 1);
     }
+}
+
+inline uint64_t get_function_argument_x64_syscall(x86_64_emulator& emu, const size_t index)
+{
+    if (index == 0)
+    {
+        return emu.reg(x86_register::r10);
+    }
+
+    return get_function_argument_x64_fastcall(emu, index);
+}
+
+inline bool is_32bit_code_segment(x86_64_emulator& emu)
+{
+    const auto cs_selector = emu.reg<uint16_t>(x86_register::cs);
+    const auto bitness = segment_utils::get_segment_bitness(emu, cs_selector);
+    return bitness && *bitness == segment_utils::segment_bitness::bit32;
+}
+
+inline uint64_t get_function_argument_x86_stack(x86_64_emulator& emu, const size_t index)
+{
+    const auto esp = emu.reg<uint32_t>(x86_register::esp);
+    const auto address = static_cast<uint64_t>(esp) + static_cast<uint64_t>((index + 1) * sizeof(uint32_t));
+    return static_cast<uint64_t>(emu.read_memory<uint32_t>(address));
+}
+
+inline uint64_t get_function_argument(x86_64_emulator& emu, const function_calling_convention cc, const size_t index)
+{
+    using enum function_calling_convention;
+
+    switch (cc)
+    {
+    case x86_cdecl:
+    case x86_stdcall:
+        return get_function_argument_x86_stack(emu, index);
+    case x64_syscall:
+        return get_function_argument_x64_syscall(emu, index);
+    case x64_fastcall:
+        return get_function_argument_x64_fastcall(emu, index);
+    default:
+        throw std::runtime_error("Unsupported calling convention");
+    }
+}
+
+inline uint64_t get_function_argument(x86_64_emulator& emu, const size_t index, const bool is_syscall = false)
+{
+    if (is_syscall)
+    {
+        return get_function_argument_x64_syscall(emu, index);
+    }
+
+    if (is_32bit_code_segment(emu))
+    {
+        return get_function_argument_x86_stack(emu, index);
+    }
+
+    return get_function_argument_x64_fastcall(emu, index);
+}
+
+inline std::vector<uint64_t> get_function_arguments(x86_64_emulator& emu, const function_calling_convention cc, const size_t count)
+{
+    std::vector<uint64_t> args{};
+    args.reserve(count);
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        args.emplace_back(get_function_argument(emu, cc, i));
+    }
+
+    return args;
+}
+
+inline void set_function_argument_x64_fastcall(x86_64_emulator& emu, const size_t index, const uint64_t value)
+{
+    switch (index)
+    {
+    case 0:
+        emu.reg(x86_register::rcx, value);
+        break;
+    case 1:
+        emu.reg(x86_register::rdx, value);
+        break;
+    case 2:
+        emu.reg(x86_register::r8, value);
+        break;
+    case 3:
+        emu.reg(x86_register::r9, value);
+        break;
+    default:
+        emu.write_stack(index + 1, value);
+        break;
+    }
+}
+
+inline void set_function_argument_x64_syscall(x86_64_emulator& emu, const size_t index, const uint64_t value)
+{
+    if (index == 0)
+    {
+        emu.reg(x86_register::r10, value);
+        return;
+    }
+
+    set_function_argument_x64_fastcall(emu, index, value);
+}
+
+inline void set_function_argument_x86_stack(x86_64_emulator& emu, const size_t index, const uint64_t value)
+{
+    const auto esp = emu.reg<uint32_t>(x86_register::esp);
+    const auto address = static_cast<uint64_t>(esp) + static_cast<uint64_t>((index + 1) * sizeof(uint32_t));
+    emu.write_memory<uint32_t>(address, static_cast<uint32_t>(value));
+}
+
+inline void set_function_argument(x86_64_emulator& emu, const function_calling_convention cc, const size_t index, const uint64_t value)
+{
+    using enum function_calling_convention;
+
+    switch (cc)
+    {
+    case x86_cdecl:
+    case x86_stdcall:
+        set_function_argument_x86_stack(emu, index, value);
+        return;
+    case x64_syscall:
+        set_function_argument_x64_syscall(emu, index, value);
+        return;
+    case x64_fastcall:
+        set_function_argument_x64_fastcall(emu, index, value);
+        return;
+    default:
+        throw std::runtime_error("Unsupported calling convention");
+    }
+}
+
+inline void set_function_argument(x86_64_emulator& emu, const size_t index, const uint64_t value, const bool is_syscall = false)
+{
+    if (is_32bit_code_segment(emu))
+    {
+        set_function_argument_x86_stack(emu, index, value);
+        return;
+    }
+
+    if (is_syscall)
+    {
+        set_function_argument_x64_syscall(emu, index, value);
+        return;
+    }
+
+    set_function_argument_x64_fastcall(emu, index, value);
+}
+
+inline void set_function_arguments(x86_64_emulator& emu, const function_calling_convention cc, const std::span<const uint64_t> values)
+{
+    for (size_t i = 0; i < values.size(); ++i)
+    {
+        set_function_argument(emu, cc, i, values[i]);
+    }
+}
+
+constexpr size_t aligned_stack_space(const size_t arg_count)
+{
+    const size_t slots = (arg_count < 4) ? 4 : arg_count;
+    const size_t bytes = slots * sizeof(uint64_t);
+    return (bytes + 15) & ~15;
 }

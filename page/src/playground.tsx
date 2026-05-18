@@ -27,7 +27,10 @@ import {
   GearFill,
   PauseFill,
   HouseFill,
+  FileEarmarkArrowDownFill,
+  Memory,
 } from "react-bootstrap-icons";
+import { MemoryView } from "./components/memory-view";
 import { StatusIndicator } from "@/components/status-indicator";
 import { Header } from "./Header";
 
@@ -61,8 +64,21 @@ export interface PlaygroundState {
   emulationStatus?: EmulationStatus;
   application?: string;
   drawerOpen: boolean;
+  memoryViewOpen: boolean;
   allowWasm64: boolean;
   file?: PlaygroundFile;
+}
+
+function downloadTextFile(content: string, filename = "output.txt") {
+  const blob = new Blob([content], { type: "text/plain" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 function decodeFileData(data: string | null): PlaygroundFile | undefined {
@@ -130,11 +146,13 @@ export class Playground extends React.Component<
     this.start = this.start.bind(this);
     this.resetFilesys = this.resetFilesys.bind(this);
     this.startEmulator = this.startEmulator.bind(this);
+    this.fetchExecutionTime = this.fetchExecutionTime.bind(this);
     this.toggleEmulatorState = this.toggleEmulatorState.bind(this);
 
     this.state = {
       settings: loadSettings(),
       drawerOpen: false,
+      memoryViewOpen: false,
       allowWasm64: false,
       file: decodeFileData(getEmulateData()),
     };
@@ -150,6 +168,22 @@ export class Playground extends React.Component<
     }
   }
 
+  componentWillUnmount(): void {
+    this.state.emulator?.stop();
+  }
+
+  resetFilesystemState() {
+    this.setState({
+      filesystemPromise: undefined,
+      filesystem: undefined,
+      drawerOpen: false,
+    });
+  }
+
+  fetchExecutionTime() {
+    return this.state.emulator ? this.state.emulator.getExecutionTime() : 0;
+  }
+
   async resetFilesys() {
     if (!this.state.filesystem) {
       return;
@@ -157,14 +191,8 @@ export class Playground extends React.Component<
 
     await this.state.filesystem.delete();
 
-    this.setState({
-      filesystemPromise: undefined,
-      filesystem: undefined,
-      drawerOpen: false,
-    });
-
+    this.resetFilesystemState();
     this.output.current?.clear();
-
     location.reload();
   }
 
@@ -186,8 +214,9 @@ export class Playground extends React.Component<
       return this.state.filesystemPromise;
     }
 
-    const promise = new Promise<Filesystem>((resolve) => {
+    const promise = new Promise<Filesystem>((resolve, reject) => {
       if (!force) {
+        this.output.current?.clear();
         this.logLine("Loading filesystem...");
       }
 
@@ -198,11 +227,20 @@ export class Playground extends React.Component<
         (percent) => {
           this.logLine(`Downloading filesystem: ${percent}%`);
         },
-      ).then(resolve);
+      )
+        .then(resolve)
+        .catch(reject);
     });
 
     promise.then((filesystem) => this.setState({ filesystem }));
     this.setState({ filesystemPromise: promise });
+
+    promise.catch((e) => {
+      console.log(e);
+      this.logLine("Failed to fetch filesystem:");
+      this.logLine(e.toString());
+      this.resetFilesystemState();
+    });
 
     return promise;
   }
@@ -247,6 +285,15 @@ export class Playground extends React.Component<
     this.output.current?.logLines(lines);
   }
 
+  exportLog() {
+    if (!this.output.current) {
+      return;
+    }
+
+    const log = this.output.current.getLines();
+    downloadTextFile(log.map((l) => l.text).join("\n"));
+  }
+
   isEmulatorPaused() {
     return (
       this.state.emulator &&
@@ -267,8 +314,7 @@ export class Playground extends React.Component<
     this.output.current?.clear();
 
     this.setDrawerOpen(false);
-
-    this.logLine("Starting emulation...");
+    this.setState({ memoryViewOpen: false });
 
     if (this.state.filesystemPromise) {
       await this.state.filesystemPromise;
@@ -294,20 +340,25 @@ export class Playground extends React.Component<
         <Header
           title="Sogen - Playground"
           description="Playground to test and run Sogen, a Windows user space emulator, right in your browser."
-          preload={
-            [
-              /*"./emulator-worker.js", "./analyzer.js", "./analyzer.wasm"*/
-            ]
-          }
         />
-        <div className="h-[100dvh] flex flex-col">
+        <div className="h-dvh flex flex-col">
           <header className="flex shrink-0 items-center gap-2 border-b p-2 overflow-y-auto">
-            <a href="#/">
-              <Button size="sm" variant="secondary" className="fancy">
+            <a title="Home" href="#/">
+              <Button
+                size="sm"
+                variant="secondary"
+                className="fancy"
+                title="Home Button"
+              >
                 <HouseFill />
               </Button>
             </a>
-            <Button size="sm" className="fancy" onClick={this.start}>
+            <Button
+              size="sm"
+              className="fancy"
+              onClick={this.start}
+              title="Start"
+            >
               <PlayFill /> <span>Start</span>
             </Button>
 
@@ -317,6 +368,7 @@ export class Playground extends React.Component<
                 isFinalState(this.state.emulator.getState())
               }
               size="sm"
+              title="Stop"
               variant="secondary"
               className="fancy"
               onClick={() => this.state.emulator?.stop()}
@@ -325,6 +377,7 @@ export class Playground extends React.Component<
             </Button>
             <Button
               size="sm"
+              title={this.isEmulatorPaused() ? "Resume" : "Pause"}
               disabled={
                 !this.state.emulator ||
                 isFinalState(this.state.emulator.getState())
@@ -346,7 +399,12 @@ export class Playground extends React.Component<
 
             <Popover>
               <PopoverTrigger asChild>
-                <Button size="sm" variant="secondary" className="fancy">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  className="fancy"
+                  title="Settings"
+                >
                   <GearFill />{" "}
                   <span className="hidden sm:inline">Settings</span>
                 </Button>
@@ -363,6 +421,39 @@ export class Playground extends React.Component<
               </PopoverContent>
             </Popover>
 
+            <Button
+              disabled={
+                !this.output.current ||
+                !this.state.emulator ||
+                this.state.emulator.getState() == EmulationState.Running
+              }
+              size="sm"
+              title="Export Log"
+              variant="secondary"
+              className="fancy"
+              onClick={() => this.exportLog()}
+            >
+              <FileEarmarkArrowDownFill />{" "}
+              <span className="hidden sm:inline">Export Log</span>
+            </Button>
+
+            <Button
+              disabled={!this.state.emulator || !this.isEmulatorPaused()}
+              size="sm"
+              title={
+                this.isEmulatorPaused()
+                  ? "Memory View"
+                  : "Pause emulation to inspect memory"
+              }
+              variant={this.state.memoryViewOpen ? "default" : "secondary"}
+              className="fancy"
+              onClick={() =>
+                this.setState({ memoryViewOpen: !this.state.memoryViewOpen })
+              }
+            >
+              <Memory /> <span className="hidden sm:inline">Memory View</span>
+            </Button>
+
             {!this.state.filesystem ? (
               <></>
             ) : (
@@ -370,7 +461,7 @@ export class Playground extends React.Component<
                 open={this.state.drawerOpen}
                 onOpenChange={(o) => this.setState({ drawerOpen: o })}
               >
-                <DrawerContent className="!will-change-auto">
+                <DrawerContent className="will-change-auto!">
                   <DrawerHeader>
                     <DrawerTitle className="hidden">
                       Filesystem Explorer
@@ -406,11 +497,23 @@ export class Playground extends React.Component<
               />
             </div>
           </header>
-          <div className="flex flex-1">
-            <EmulationSummary status={this.state.emulationStatus} />
-            <div className="flex flex-1 flex-col pl-1 overflow-auto">
-              <Output ref={this.output} />
+          <div className="flex flex-1 min-h-0">
+            <div className="relative flex flex-1 flex-col min-w-0">
+              <EmulationSummary
+                status={this.state.emulationStatus}
+                executionTimeFetcher={this.fetchExecutionTime}
+              />
+              <div className="flex flex-1 flex-col pl-1 overflow-auto min-w-0">
+                <Output ref={this.output} />
+              </div>
             </div>
+            {this.state.memoryViewOpen && this.state.emulator && (
+              <MemoryView
+                emulator={this.state.emulator}
+                paused={!!this.isEmulatorPaused()}
+                onClose={() => this.setState({ memoryViewOpen: false })}
+              />
+            )}
           </div>
         </div>
       </>

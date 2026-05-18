@@ -124,8 +124,26 @@ namespace
     }
 }
 
+#ifdef OS_WINDOWS
+logger::logger()
+{
+    old_cp = GetConsoleOutputCP();
+    SetConsoleOutputCP(CP_UTF8);
+}
+
+logger::~logger()
+{
+    SetConsoleOutputCP(old_cp);
+}
+#endif
+
 void logger::print_message(const color c, const std::string_view message, const bool force) const
 {
+    // Sinks observe all log activity, regardless of disable_output_. That lets
+    // consumers capture a full structured log even when they've silenced the
+    // terminal (e.g. --silent, or a Python wrapper capturing via callback).
+    this->sink_(c, message);
+
     if (!force && this->disable_output_)
     {
         return;
@@ -144,6 +162,13 @@ void logger::print(const color c, const char* message, ...)
 {
     format_to_string(message, data);
     this->print_message(c, data);
+}
+
+// NOLINTNEXTLINE(cert-dcl50-cpp)
+void logger::force_print(const color c, const char* message, ...)
+{
+    format_to_string(message, data);
+    this->print_message(c, data, true);
 }
 
 // NOLINTNEXTLINE(cert-dcl50-cpp)

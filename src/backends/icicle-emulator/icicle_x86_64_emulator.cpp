@@ -178,6 +178,21 @@ namespace icicle
             }
         }
 
+        pointer_type get_segment_base(const x86_register base) override
+        {
+            switch (base)
+            {
+            case x86_register::fs:
+            case x86_register::fs_base:
+                return this->reg(x86_register::fs_base);
+            case x86_register::gs:
+            case x86_register::gs_base:
+                return this->reg(x86_register::gs_base);
+            default:
+                return 0;
+            }
+        }
+
         size_t write_raw_register(const int reg, const void* value, const size_t size) override
         {
             return icicle_write_register(this->emu_, reg, value, size);
@@ -186,6 +201,29 @@ namespace icicle
         size_t read_raw_register(const int reg, void* value, const size_t size) override
         {
             return icicle_read_register(this->emu_, reg, value, size);
+        }
+
+        bool read_descriptor_table(const int reg, descriptor_table_register& table) override
+        {
+            if (reg != static_cast<int>(x86_register::gdtr) && reg != static_cast<int>(x86_register::idtr))
+            {
+                return false;
+            }
+
+            struct gdtr
+            {
+                uint32_t padding{};
+                uint32_t limit{};
+                uint64_t address{};
+            };
+
+            gdtr entry{};
+            static_assert(sizeof(gdtr) - offsetof(gdtr, limit) == 12);
+            this->read_register(x86_register::gdtr, &entry.limit, 12);
+
+            table.base = entry.address;
+            table.limit = entry.limit;
+            return true;
         }
 
         void map_mmio(const uint64_t address, const size_t size, mmio_read_callback read_cb, mmio_write_callback write_cb) override
@@ -241,9 +279,14 @@ namespace icicle
             ice(res, "Failed to read memory");
         }
 
+        bool try_write_memory(const uint64_t address, const void* data, const size_t size) override
+        {
+            return icicle_write_memory(this->emu_, address, data, size);
+        }
+
         void write_memory(const uint64_t address, const void* data, const size_t size) override
         {
-            const auto res = icicle_write_memory(this->emu_, address, data, size);
+            const auto res = try_write_memory(address, data, size);
             ice(res, "Failed to write memory");
         }
 
@@ -320,7 +363,9 @@ namespace icicle
 
                 const auto& func = *static_cast<decltype(ptr)>(user);
                 const auto res = func(address, 1, static_cast<memory_operation>(operation), violation_type);
-                return res == memory_violation_continuation::resume ? 1 : 0;
+                const auto restart = res == memory_violation_continuation::restart;
+                const auto resume = res == memory_violation_continuation::resume || restart;
+                return resume ? 1 : 0;
             };
 
             const auto id = icicle_add_violation_hook(this->emu_, wrapper, ptr);
@@ -441,6 +486,11 @@ namespace icicle
         bool has_violation() const override
         {
             return false;
+        }
+
+        bool supports_instruction_counting() const override
+        {
+            return true;
         }
 
         std::string get_name() const override

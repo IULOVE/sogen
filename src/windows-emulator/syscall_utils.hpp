@@ -5,6 +5,8 @@
 #include <platform/primitives.hpp>
 #include "devices/named_pipe.hpp"
 
+struct completion_state;
+
 struct syscall_context
 {
     windows_emulator& win_emu;
@@ -12,6 +14,35 @@ struct syscall_context
     process_context& proc;
     mutable bool write_status{true};
     mutable bool retrigger_syscall{false};
+
+    mutable bool run_callback{false};
+    bool is_callback_completion{false};
+    completion_state* current_completion_state{};
+    uint64_t previous_callback_result{};
+
+    template <typename T>
+    T get_callback_result() const
+    {
+        if (!this->is_callback_completion)
+        {
+            throw std::runtime_error("Attempted to get callback result in a non-completion context");
+        }
+        return static_cast<T>(this->previous_callback_result);
+    }
+
+    template <typename T>
+    T& get_completion_state() const
+    {
+        if (!this->is_callback_completion)
+        {
+            throw std::runtime_error("Attempted to get callback state in a non-completion context");
+        }
+        if (!this->current_completion_state)
+        {
+            throw std::runtime_error("No state object was assigned to this completion");
+        }
+        return dynamic_cast<T&>(*this->current_completion_state);
+    }
 };
 
 inline uint64_t get_syscall_argument(x86_64_emulator& emu, const size_t index)
@@ -31,7 +62,7 @@ inline bool is_syscall(const std::string_view name)
 
 inline bool is_named_pipe_path(const std::u16string_view& filename)
 {
-    return filename == u"\\Device\\NamedPipe\\" || filename.starts_with(u"\\Device\\NamedPipe\\");
+    return filename == u"\\Device\\NamedPipe\\" || filename.starts_with(u"\\Device\\NamedPipe\\") || filename.starts_with(u"\\??\\pipe\\");
 }
 
 inline std::optional<uint32_t> extract_syscall_id(const exported_symbol& symbol, std::span<const std::byte> data)
@@ -134,13 +165,13 @@ T resolve_indexed_argument(x86_64_emulator& emu, size_t& index)
 
 inline void write_syscall_result(const syscall_context& c, const uint64_t result, const uint64_t initial_ip)
 {
-    if (c.write_status && !c.retrigger_syscall)
+    if (c.write_status && !c.retrigger_syscall && !c.run_callback)
     {
         c.emu.reg<uint64_t>(x86_register::rax, result);
     }
 
     const auto new_ip = c.emu.read_instruction_pointer();
-    if (initial_ip != new_ip || c.retrigger_syscall)
+    if ((initial_ip != new_ip || c.retrigger_syscall || c.run_callback) && !c.is_callback_completion)
     {
         c.emu.reg(x86_register::rip, new_ip - 2);
     }
@@ -232,7 +263,7 @@ NTSTATUS handle_query(x86_64_emulator& emu, const uint64_t buffer, const uint32_
     const auto length_setter = [&](const size_t required_size) {
         if (return_length)
         {
-            return_length.write(static_cast<LengthType>(required_size));
+            return_length.try_write(static_cast<LengthType>(required_size));
         }
     };
 

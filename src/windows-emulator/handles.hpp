@@ -2,6 +2,8 @@
 
 #include <serialization.hpp>
 
+// NOLINTBEGIN(cppcoreguidelines-use-enum-class)
+
 struct handle_types
 {
     enum type : uint16_t
@@ -21,29 +23,40 @@ struct handle_types
         token,
         window,
         timer,
+        monitor,
+        desktop,
+        io_completion,
+        wait_completion_packet,
+        worker_factory,
+        private_namespace,
     };
 };
+
+// NOLINTEND(cppcoreguidelines-use-enum-class)
 
 #pragma pack(push)
 #pragma pack(1)
 struct handle_value
 {
-    uint64_t id : 32;
-    uint64_t type : 16;
-    uint64_t padding : 14;
+    uint64_t id : 23;
+    uint64_t type : 7;
     uint64_t is_system : 1;
     uint64_t is_pseudo : 1;
+    uint64_t high_bits : 32;
 };
 #pragma pack(pop)
 
 static_assert(sizeof(handle_value) == 8);
 
 // TODO: this is a concrete 64bit handle
-union handle
+struct handle
 {
-    handle_value value;
-    uint64_t bits;
-    std::uint64_t h;
+    union
+    {
+        handle_value value;
+        uint64_t bits;
+        std::uint64_t h;
+    };
 };
 
 namespace utils
@@ -61,12 +74,16 @@ namespace utils
 
 inline bool operator==(const handle& h1, const handle& h2)
 {
-    return h1.bits == h2.bits;
+    uint64_t h1_bits = (h1.bits & 0x00000000FFFFFFFF);
+    uint64_t h2_bits = (h2.bits & 0x00000000FFFFFFFF);
+    return h1_bits == h2_bits;
 }
 
 inline bool operator==(const handle& h1, const uint64_t& h2)
 {
-    return h1.bits == h2;
+    uint64_t h1_bits = (h1.bits & 0x00000000FFFFFFFF);
+    uint64_t h2_bits = (h2 & 0x00000000FFFFFFFF);
+    return h1_bits == h2_bits;
 }
 
 inline handle_value get_handle_value(const uint64_t h)
@@ -80,7 +97,7 @@ constexpr handle make_handle(const uint32_t id, const handle_types::type type, c
 {
     handle_value value{};
 
-    value.padding = 0;
+    // value.padding = 0;
     value.id = id;
     value.type = type;
     value.is_system = false;
@@ -409,8 +426,10 @@ constexpr auto NULL_HANDLE = make_handle(0ULL);
 constexpr auto KNOWN_DLLS_DIRECTORY = make_pseudo_handle(0x1, handle_types::directory);
 constexpr auto BASE_NAMED_OBJECTS_DIRECTORY = make_pseudo_handle(0x2, handle_types::directory);
 constexpr auto RPC_CONTROL_DIRECTORY = make_pseudo_handle(0x3, handle_types::directory);
+constexpr auto KNOWN_DLLS32_DIRECTORY = make_pseudo_handle(0x4, handle_types::directory);
 
 constexpr auto KNOWN_DLLS_SYMLINK = make_pseudo_handle(0x1, handle_types::symlink);
+constexpr auto KNOWN_DLLS32_SYMLINK = make_pseudo_handle(0x2, handle_types::symlink);
 constexpr auto SHARED_SECTION = make_pseudo_handle(0x1, handle_types::section);
 constexpr auto DBWIN_BUFFER = make_pseudo_handle(0x2, handle_types::section);
 
@@ -423,6 +442,7 @@ constexpr auto LSA_AUTHENTICATION_INITIALIZED = make_pseudo_handle(0x5, handle_t
 constexpr auto CONSOLE_HANDLE = make_pseudo_handle(0x1, handle_types::file);
 constexpr auto STDOUT_HANDLE = make_pseudo_handle(0x2, handle_types::file);
 constexpr auto STDIN_HANDLE = make_pseudo_handle(0x3, handle_types::file);
+constexpr auto NUL_HANDLE = make_pseudo_handle(0x4, handle_types::file);
 
 constexpr auto DUMMY_IMPERSONATION_TOKEN = make_pseudo_handle(0x1, handle_types::token);
 

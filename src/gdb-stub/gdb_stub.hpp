@@ -1,6 +1,9 @@
 #pragma once
 #include <cstdint>
 #include <network/address.hpp>
+#include <stdexcept>
+
+#include "filesystem_interface.hpp"
 
 namespace gdb_stub
 {
@@ -8,6 +11,7 @@ namespace gdb_stub
     {
         none,
         resume,
+        output,
         shutdown,
     };
 
@@ -19,6 +23,27 @@ namespace gdb_stub
         hardware_read = 3,
         hardware_read_write = 4,
         END,
+    };
+
+    struct library_info
+    {
+        std::string name;
+        uint64_t segment_address;
+    };
+
+    struct thread_info
+    {
+        uint32_t id;
+        std::string name;
+    };
+
+    class binding_error : public std::runtime_error
+    {
+      public:
+        binding_error(const std::string& address)
+            : std::runtime_error(address)
+        {
+        }
     };
 
     struct debugging_handler
@@ -54,6 +79,57 @@ namespace gdb_stub
         virtual bool should_stop()
         {
             return false;
+        }
+
+        virtual std::vector<library_info> get_libraries()
+        {
+            return {};
+        }
+
+        virtual void reset_library_stop()
+        {
+        }
+
+        virtual bool should_signal_library()
+        {
+            return false;
+        }
+
+        virtual std::string get_executable_path()
+        {
+            return {};
+        }
+
+        virtual std::vector<thread_info> get_thread_list() const
+        {
+            return {};
+        }
+
+        virtual uint64_t get_thread_teb_addr(uint32_t id) const
+        {
+            (void)id;
+            return 0;
+        }
+
+        virtual std::string consume_debug_output()
+        {
+            return {};
+        }
+
+        virtual std::string get_os_abi()
+        {
+            return {};
+        }
+
+        virtual std::string translate_path(std::string_view emulated_path) const
+        {
+            (void)emulated_path;
+            return {};
+        }
+
+        virtual filesystem_interface* get_filesystem()
+        {
+            return nullptr;
         }
     };
 

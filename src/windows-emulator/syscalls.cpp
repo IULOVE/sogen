@@ -7,7 +7,6 @@
 #include <numeric>
 #include <cwctype>
 #include <algorithm>
-#include <utils/string.hpp>
 #include <utils/time.hpp>
 #include <utils/finally.hpp>
 
@@ -16,7 +15,9 @@ namespace syscalls
     // syscalls/event.cpp:
     NTSTATUS handle_NtSetEvent(const syscall_context& c, uint64_t handle, emulator_object<LONG> previous_state);
     NTSTATUS handle_NtTraceEvent();
-    NTSTATUS handle_NtQueryEvent();
+    NTSTATUS handle_NtQueryEvent(const syscall_context& c, handle event_handle, uint32_t event_information_class,
+                                 emulator_object<EVENT_BASIC_INFORMATION> event_information, uint32_t event_information_length,
+                                 emulator_object<uint32_t> return_length);
     NTSTATUS handle_NtClearEvent(const syscall_context& c, handle event_handle);
     NTSTATUS handle_NtCreateEvent(const syscall_context& c, emulator_object<handle> event_handle, ACCESS_MASK desired_access,
                                   emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes, EVENT_TYPE event_type,
@@ -27,7 +28,7 @@ namespace syscalls
     // syscalls/exception.cpp
     NTSTATUS handle_NtRaiseHardError(const syscall_context& c, NTSTATUS error_status, ULONG number_of_parameters,
                                      emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> unicode_string_parameter_mask,
-                                     emulator_object<DWORD> parameters, HARDERROR_RESPONSE_OPTION valid_response_option,
+                                     uint64_t parameters, HARDERROR_RESPONSE_OPTION valid_response_option,
                                      emulator_object<HARDERROR_RESPONSE> response);
     NTSTATUS handle_NtRaiseException(const syscall_context& c,
                                      emulator_object<EMU_EXCEPTION_RECORD<EmulatorTraits<Emu64>>> exception_record,
@@ -65,6 +66,13 @@ namespace syscalls
                                 uint64_t /*apc_context*/, emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
                                 uint64_t buffer, ULONG length, emulator_object<LARGE_INTEGER> /*byte_offset*/,
                                 emulator_object<ULONG> /*key*/);
+    NTSTATUS handle_NtLockFile(const syscall_context& c, handle file_handle, handle event_handle, uint64_t apc_routine,
+                               uint64_t apc_context, emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
+                               emulator_object<LARGE_INTEGER> byte_offset, emulator_object<LARGE_INTEGER> length, ULONG key,
+                               BOOLEAN fail_immediately, BOOLEAN exclusive_lock);
+    NTSTATUS handle_NtUnlockFile(const syscall_context& c, handle file_handle,
+                                 emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
+                                 emulator_object<LARGE_INTEGER> byte_offset, emulator_object<LARGE_INTEGER> length, ULONG key);
     NTSTATUS handle_NtCreateFile(const syscall_context& c, emulator_object<handle> file_handle, ACCESS_MASK desired_access,
                                  emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
                                  emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> /*io_status_block*/,
@@ -83,6 +91,9 @@ namespace syscalls
     NTSTATUS handle_NtOpenDirectoryObject(const syscall_context& c, emulator_object<handle> directory_handle,
                                           ACCESS_MASK /*desired_access*/,
                                           emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes);
+    NTSTATUS handle_NtCreateDirectoryObject(const syscall_context& /*c*/, emulator_object<handle> /*directory_handle*/,
+                                            ACCESS_MASK /*desired_access*/,
+                                            emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes);
     NTSTATUS handle_NtOpenSymbolicLinkObject(const syscall_context& c, emulator_object<handle> link_handle, ACCESS_MASK /*desired_access*/,
                                              emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes);
     NTSTATUS handle_NtQuerySymbolicLinkObject(const syscall_context& c, handle link_handle,
@@ -122,7 +133,8 @@ namespace syscalls
                                            emulator_object<uint32_t> old_protection);
     NTSTATUS handle_NtAllocateVirtualMemoryEx(const syscall_context& c, handle process_handle, emulator_object<uint64_t> base_address,
                                               emulator_object<uint64_t> bytes_to_allocate, uint32_t allocation_type,
-                                              uint32_t page_protection);
+                                              uint32_t page_protection, emulator_object<MEM_EXTENDED_PARAMETER64> extended_parameters,
+                                              ULONG extended_parameter_count);
     NTSTATUS handle_NtAllocateVirtualMemory(const syscall_context& c, handle process_handle, emulator_object<uint64_t> base_address,
                                             uint64_t zero_bits, emulator_object<uint64_t> bytes_to_allocate, uint32_t allocation_type,
                                             uint32_t page_protection);
@@ -131,7 +143,15 @@ namespace syscalls
     NTSTATUS handle_NtReadVirtualMemory(const syscall_context& c, handle process_handle, emulator_pointer base_address,
                                         emulator_pointer buffer, ULONG number_of_bytes_to_read,
                                         emulator_object<ULONG> number_of_bytes_read);
+    NTSTATUS handle_NtWriteVirtualMemory(const syscall_context& c, handle process_handle, emulator_pointer base_address,
+                                         emulator_pointer buffer, ULONG number_of_bytes_to_write,
+                                         emulator_object<ULONG> number_of_bytes_write);
     NTSTATUS handle_NtSetInformationVirtualMemory();
+    BOOL handle_NtLockVirtualMemory();
+    NTSTATUS handle_NtUnlockVirtualMemory();
+    NTSTATUS handle_NtFlushVirtualMemory(const syscall_context& c, handle process_handle, emulator_object<uint64_t> base_address,
+                                         emulator_object<uint64_t> region_size,
+                                         emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block);
 
     // syscalls/mutant.cpp:
     NTSTATUS handle_NtReleaseMutant(const syscall_context& c, handle mutant_handle, emulator_object<LONG> previous_count);
@@ -139,6 +159,16 @@ namespace syscalls
                                  emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes);
     NTSTATUS handle_NtCreateMutant(const syscall_context& c, emulator_object<handle> mutant_handle, ACCESS_MASK desired_access,
                                    emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes, BOOLEAN initial_owner);
+
+    // syscalls/namespace.cpp:
+    NTSTATUS handle_NtCreatePrivateNamespace(const syscall_context& c, emulator_object<handle> namespace_handle, ACCESS_MASK desired_access,
+                                             emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
+                                             emulator_object<OBJECT_BOUNDARY_DESCRIPTOR> boundary_descriptor);
+
+    NTSTATUS handle_NtOpenPrivateNamespace(const syscall_context& c, emulator_object<handle> namespace_handle, ACCESS_MASK desired_access,
+                                           emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
+                                           emulator_object<OBJECT_BOUNDARY_DESCRIPTOR> boundary_descriptor);
+    NTSTATUS handle_NtDeletePrivateNamespace(const syscall_context& c, handle namespace_handle);
 
     // syscalls/object.cpp:
     NTSTATUS handle_NtClose(const syscall_context& c, handle h);
@@ -148,12 +178,16 @@ namespace syscalls
     NTSTATUS handle_NtQueryObject(const syscall_context& c, handle handle, OBJECT_INFORMATION_CLASS object_information_class,
                                   emulator_pointer object_information, ULONG object_information_length,
                                   emulator_object<ULONG> return_length);
+    NTSTATUS handle_NtCompareObjects(const syscall_context& c, handle first, handle second);
     NTSTATUS handle_NtWaitForMultipleObjects(const syscall_context& c, ULONG count, emulator_object<handle> handles, WAIT_TYPE wait_type,
                                              BOOLEAN alertable, emulator_object<LARGE_INTEGER> timeout);
+    NTSTATUS handle_NtWaitForMultipleObjects32(const syscall_context& c, ULONG count, emulator_object<uint32_t> handles,
+                                               WAIT_TYPE wait_type, BOOLEAN alertable, emulator_object<LARGE_INTEGER> timeout);
     NTSTATUS handle_NtWaitForSingleObject(const syscall_context& c, handle h, BOOLEAN alertable, emulator_object<LARGE_INTEGER> timeout);
     NTSTATUS handle_NtSetInformationObject();
     NTSTATUS handle_NtQuerySecurityObject(const syscall_context& c, handle /*h*/, SECURITY_INFORMATION /*security_information*/,
                                           emulator_pointer security_descriptor, ULONG length, emulator_object<ULONG> length_needed);
+    NTSTATUS handle_NtSetSecurityObject();
 
     // syscalls/port.cpp:
     NTSTATUS handle_NtConnectPort(const syscall_context& c, emulator_object<handle> client_port_handle,
@@ -170,8 +204,23 @@ namespace syscalls
                                         emulator_object<REMOTE_PORT_VIEW64> server_shared_memory,
                                         emulator_object<ULONG> maximum_message_length, emulator_pointer connection_info,
                                         emulator_object<ULONG> connection_info_length);
+    NTSTATUS handle_NtAlpcConnectPort(const syscall_context& c, emulator_object<handle> port_handle,
+                                      emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> server_port_name,
+                                      emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> /*object_attributes*/,
+                                      emulator_pointer /*port_attributes*/, ULONG /*flags*/, emulator_pointer /*required_server_sid*/,
+                                      emulator_pointer /*connection_message*/,
+                                      emulator_object<EmulatorTraits<Emu64>::SIZE_T> /*buffer_length*/,
+                                      emulator_pointer /*out_message_attributes*/, emulator_pointer /*in_message_attributes*/,
+                                      emulator_object<LARGE_INTEGER> /*timeout*/);
+    NTSTATUS handle_NtAlpcConnectPortEx(const syscall_context& c, emulator_object<handle> port_handle,
+                                        emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> connection_port_object_attributes,
+                                        emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> /*client_port_object_attributes*/,
+                                        emulator_pointer port_attributes, ULONG flags, emulator_pointer /*server_security_requirements*/,
+                                        emulator_pointer connection_message, emulator_object<EmulatorTraits<Emu64>::SIZE_T> buffer_length,
+                                        emulator_pointer out_message_attributes, emulator_pointer in_message_attributes,
+                                        emulator_object<LARGE_INTEGER> timeout);
     NTSTATUS handle_NtAlpcSendWaitReceivePort(const syscall_context& c, handle port_handle, ULONG /*flags*/,
-                                              emulator_object<PORT_MESSAGE64> /*send_message*/,
+                                              emulator_object<PORT_MESSAGE64> send_message,
                                               emulator_object<ALPC_MESSAGE_ATTRIBUTES>
                                               /*send_message_attributes*/,
                                               emulator_object<PORT_MESSAGE64> receive_message,
@@ -179,8 +228,10 @@ namespace syscalls
                                               emulator_object<ALPC_MESSAGE_ATTRIBUTES>
                                               /*receive_message_attributes*/,
                                               emulator_object<LARGE_INTEGER> /*timeout*/);
-    NTSTATUS handle_NtAlpcConnectPort();
-    NTSTATUS handle_NtAlpcConnectPortEx();
+    NTSTATUS handle_NtAlpcQueryInformation();
+    NTSTATUS handle_NtAlpcSetInformation();
+    NTSTATUS handle_NtAlpcCreateSecurityContext();
+    NTSTATUS handle_NtAlpcDeleteSecurityContext();
 
     // syscalls/process.cpp:
     NTSTATUS handle_NtQueryInformationProcess(const syscall_context& c, handle process_handle, uint32_t info_class,
@@ -194,6 +245,7 @@ namespace syscalls
     NTSTATUS handle_NtOpenProcessTokenEx(const syscall_context& c, handle process_handle, ACCESS_MASK desired_access,
                                          ULONG /*handle_attributes*/, emulator_object<handle> token_handle);
     NTSTATUS handle_NtTerminateProcess(const syscall_context& c, handle process_handle, NTSTATUS exit_status);
+    NTSTATUS handle_NtFlushProcessWriteBuffers(const syscall_context& c);
 
     // syscalls/registry.cpp:
     NTSTATUS handle_NtOpenKey(const syscall_context& c, emulator_object<handle> key_handle, ACCESS_MASK /*desired_access*/,
@@ -206,12 +258,19 @@ namespace syscalls
                                     emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> value_name,
                                     KEY_VALUE_INFORMATION_CLASS key_value_information_class, uint64_t key_value_information, ULONG length,
                                     emulator_object<ULONG> result_length);
+    NTSTATUS handle_NtQueryMultipleValueKey(const syscall_context& c, handle key_handle, emulator_object<KEY_VALUE_ENTRY> value_entries,
+                                            ULONG entry_count, uint64_t value_buffer, emulator_object<ULONG> buffer_length,
+                                            emulator_object<ULONG> required_buffer_length);
     NTSTATUS handle_NtCreateKey(const syscall_context& c, emulator_object<handle> key_handle, ACCESS_MASK desired_access,
                                 emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes, ULONG /*title_index*/,
                                 emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> /*class*/, ULONG /*create_options*/,
                                 emulator_object<ULONG> /*disposition*/);
+    NTSTATUS handle_NtSetValueKey(const syscall_context& c, handle key_handle,
+                                  emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> value_name, ULONG /*title_index*/, ULONG type,
+                                  uint64_t data, ULONG data_size);
     NTSTATUS handle_NtNotifyChangeKey();
-    NTSTATUS handle_NtSetInformationKey();
+    NTSTATUS handle_NtSetInformationKey(const syscall_context& c, handle key_handle, KEY_SET_INFORMATION_CLASS key_information_class,
+                                        uint64_t key_information, ULONG length);
     NTSTATUS handle_NtEnumerateKey(const syscall_context& c, handle key_handle, ULONG index, KEY_INFORMATION_CLASS key_information_class,
                                    uint64_t key_information, ULONG length, emulator_object<ULONG> result_length);
     NTSTATUS handle_NtEnumerateValueKey(const syscall_context& c, handle key_handle, ULONG index,
@@ -225,6 +284,9 @@ namespace syscalls
                                     ULONG allocation_attributes, handle file_handle);
     NTSTATUS handle_NtOpenSection(const syscall_context& c, emulator_object<handle> section_handle, ACCESS_MASK /*desired_access*/,
                                   emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes);
+    NTSTATUS handle_NtQuerySection(const syscall_context& c, handle section_handle, SECTION_INFORMATION_CLASS section_information_class,
+                                   uint64_t section_information, EmulatorTraits<Emu64>::SIZE_T section_information_length,
+                                   emulator_object<EmulatorTraits<Emu64>::SIZE_T> result_length);
     NTSTATUS handle_NtMapViewOfSection(const syscall_context& c, handle section_handle, handle process_handle,
                                        emulator_object<uint64_t> base_address,
                                        EMULATOR_CAST(EmulatorTraits<Emu64>::ULONG_PTR, ULONG_PTR) /*zero_bits*/,
@@ -232,6 +294,12 @@ namespace syscalls
                                        emulator_object<LARGE_INTEGER> /*section_offset*/,
                                        emulator_object<EMULATOR_CAST(EmulatorTraits<Emu64>::SIZE_T, SIZE_T)> view_size,
                                        SECTION_INHERIT /*inherit_disposition*/, ULONG /*allocation_type*/, ULONG /*win32_protect*/);
+    NTSTATUS handle_NtMapViewOfSectionEx(const syscall_context& c, handle section_handle, handle process_handle,
+                                         emulator_object<uint64_t> base_address, emulator_object<LARGE_INTEGER> section_offset,
+                                         emulator_object<EMULATOR_CAST(EmulatorTraits<Emu64>::SIZE_T, SIZE_T)> view_size,
+                                         ULONG allocation_type, ULONG page_protection,
+                                         uint64_t extended_parameters, // PMEM_EXTENDED_PARAMETER
+                                         ULONG extended_parameter_count);
     NTSTATUS handle_NtUnmapViewOfSection(const syscall_context& c, handle process_handle, uint64_t base_address);
     NTSTATUS handle_NtUnmapViewOfSectionEx(const syscall_context& c, handle process_handle, uint64_t base_address, ULONG /*flags*/);
     NTSTATUS handle_NtAreMappedFilesTheSame();
@@ -260,9 +328,9 @@ namespace syscalls
     NTSTATUS handle_NtQueryInformationThread(const syscall_context& c, handle thread_handle, uint32_t info_class,
                                              uint64_t thread_information, uint32_t thread_information_length,
                                              emulator_object<uint32_t> return_length);
-    NTSTATUS handle_NtOpenThread(const syscall_context&, handle thread_handle, ACCESS_MASK /*desired_access*/,
-                                 emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> /*object_attributes*/,
-                                 emulator_pointer /*client_id*/);
+    NTSTATUS handle_NtOpenThread(const syscall_context&, emulator_object<handle> thread_handle, ACCESS_MASK desired_access,
+                                 emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
+                                 emulator_object<CLIENT_ID64> client_id);
     NTSTATUS handle_NtOpenThreadToken(const syscall_context&, handle thread_handle, ACCESS_MASK /*desired_access*/,
                                       BOOLEAN /*open_as_self*/, emulator_object<handle> token_handle);
     NTSTATUS handle_NtOpenThreadTokenEx(const syscall_context& c, handle thread_handle, ACCESS_MASK desired_access, BOOLEAN open_as_self,
@@ -274,6 +342,7 @@ namespace syscalls
                                               emulator_object<EMU_RTL_SRWLOCK<EmulatorTraits<Emu64>>> lock);
     NTSTATUS handle_NtWaitForAlertByThreadId(const syscall_context& c, uint64_t, emulator_object<LARGE_INTEGER> timeout);
     NTSTATUS handle_NtYieldExecution(const syscall_context& c);
+    NTSTATUS handle_NtSuspendThread(const syscall_context& c, handle thread_handle, emulator_object<ULONG> previous_suspend_count);
     NTSTATUS handle_NtResumeThread(const syscall_context& c, handle thread_handle, emulator_object<ULONG> previous_suspend_count);
     NTSTATUS handle_NtContinue(const syscall_context& c, emulator_object<CONTEXT64> thread_context, BOOLEAN raise_alert);
     NTSTATUS handle_NtContinueEx(const syscall_context& c, emulator_object<CONTEXT64> thread_context, uint64_t continue_argument);
@@ -286,7 +355,7 @@ namespace syscalls
                                      /*object_attributes*/,
                                      handle process_handle, uint64_t start_routine, uint64_t argument, ULONG create_flags,
                                      EmulatorTraits<Emu64>::SIZE_T /*zero_bits*/, EmulatorTraits<Emu64>::SIZE_T stack_size,
-                                     EmulatorTraits<Emu64>::SIZE_T /*maximum_stack_size*/,
+                                     EmulatorTraits<Emu64>::SIZE_T maximum_stack_size,
                                      emulator_object<PS_ATTRIBUTE_LIST<EmulatorTraits<Emu64>>> attribute_list);
     NTSTATUS handle_NtGetCurrentProcessorNumberEx(const syscall_context&, emulator_object<PROCESSOR_NUMBER> processor_number);
     ULONG handle_NtGetCurrentProcessorNumber();
@@ -296,6 +365,8 @@ namespace syscalls
                                        uint64_t apc_argument1, uint64_t apc_argument2, uint64_t apc_argument3);
     NTSTATUS handle_NtQueueApcThread(const syscall_context& c, handle thread_handle, uint64_t apc_routine, uint64_t apc_argument1,
                                      uint64_t apc_argument2, uint64_t apc_argument3);
+    NTSTATUS handle_NtCallbackReturn(const syscall_context& c, emulator_pointer callback_result, ULONG callback_result_length,
+                                     NTSTATUS callback_status);
 
     // syscalls/timer.cpp:
     NTSTATUS handle_NtQueryTimerResolution(const syscall_context&, emulator_object<ULONG> maximum_time, emulator_object<ULONG> minimum_time,
@@ -307,6 +378,8 @@ namespace syscalls
                                    ACCESS_MASK desired_access);
     NTSTATUS handle_NtCreateTimer(const syscall_context& c, emulator_object<handle> timer_handle, ACCESS_MASK desired_access,
                                   emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes, ULONG timer_type);
+    NTSTATUS handle_NtOpenTimer(const syscall_context& c, emulator_object<handle> timer_handle, ACCESS_MASK desired_access,
+                                emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes);
     NTSTATUS handle_NtSetTimer();
     NTSTATUS handle_NtSetTimer2();
     NTSTATUS handle_NtSetTimerEx(const syscall_context& c, handle timer_handle, uint32_t timer_set_info_class,
@@ -322,7 +395,182 @@ namespace syscalls
     NTSTATUS handle_NtQueryInformationToken(const syscall_context& c, handle token_handle, TOKEN_INFORMATION_CLASS token_information_class,
                                             uint64_t token_information, ULONG token_information_length,
                                             emulator_object<ULONG> return_length);
-    NTSTATUS handle_NtQuerySecurityAttributesToken();
+    NTSTATUS handle_NtQuerySecurityAttributesToken(const syscall_context& c, handle token_handle,
+                                                   emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> attributes,
+                                                   ULONG number_of_attributes, uint64_t buffer, ULONG buffer_length,
+                                                   emulator_object<ULONG> return_length);
+    NTSTATUS handle_NtAdjustPrivilegesToken();
+    NTSTATUS handle_NtFlushInstructionCache(const syscall_context& c, handle process_handle, emulator_object<uint64_t> base_address,
+                                            uint64_t region_size);
+
+    // syscalls/license.cpp
+    NTSTATUS handle_NtQueryLicenseValue(const syscall_context& c, emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> value_name,
+                                        emulator_object<uint32_t> type, uint64_t data, uint64_t data_size,
+                                        emulator_object<uint32_t> result_data_size);
+
+    // syscalls/user.cpp:
+    NTSTATUS handle_NtUserTraceLoggingSendMixedModeTelemetry();
+    NTSTATUS handle_NtUserDisplayConfigGetDeviceInfo();
+    NTSTATUS handle_NtUserRegisterWindowMessage();
+    NTSTATUS handle_NtUserGetThreadState(const syscall_context& c, ULONG routine);
+    NTSTATUS handle_NtUserProcessConnect(const syscall_context& c, handle process_handle, ULONG length, emulator_pointer user_connect);
+    NTSTATUS handle_NtUserInitializeClientPfnArrays(const syscall_context& c, emulator_pointer apfn_client_a,
+                                                    emulator_pointer apfn_client_w, emulator_pointer apfn_client_worker,
+                                                    emulator_pointer hmod_user);
+    uint64_t handle_NtUserRemoteConnectState(const syscall_context& c);
+    hdesk handle_NtUserGetThreadDesktop(const syscall_context& c, ULONG thread_id);
+    hdc handle_NtUserGetDCEx(const syscall_context& c, hwnd window, uint64_t clip_region, ULONG flags);
+    hdc handle_NtUserGetDC(const syscall_context& c, hwnd window);
+    hdc handle_NtUserGetWindowDC(const syscall_context& c, hwnd window);
+    BOOL handle_NtUserReleaseDC();
+    NTSTATUS handle_NtUserGetCursorPos();
+    NTSTATUS handle_NtUserSetCursor();
+    uint64_t handle_NtUserGetCursor();
+    NTSTATUS handle_NtUserFindExistingCursorIcon();
+    uint64_t handle_NtUserFindWindowEx(const syscall_context& c, hwnd parent, hwnd child_after,
+                                       emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> class_name,
+                                       emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> window_name);
+    BOOL handle_NtUserMoveWindow();
+    uint64_t handle_NtUserGetProcessWindowStation();
+    uint16_t handle_NtUserRegisterClassExWOW(const syscall_context& c, emulator_object<EMU_WNDCLASSEX> wnd_class_ex,
+                                             emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> class_name,
+                                             emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> class_version,
+                                             emulator_object<CLSMENUNAME<EmulatorTraits<Emu64>>> class_menu_name, DWORD function_id,
+                                             DWORD flags, emulator_pointer wow);
+    BOOL handle_NtUserUnregisterClass(const syscall_context& c, emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> class_name,
+                                      emulator_pointer instance, emulator_object<CLSMENUNAME<EmulatorTraits<Emu64>>> class_menu_name);
+    BOOL handle_NtUserGetClassInfoEx(const syscall_context& c, hinstance /*instance*/,
+                                     emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> class_name,
+                                     emulator_object<EMU_WNDCLASSEX> wnd_class_ex, emulator_pointer menu_name, BOOL /*ansi*/);
+    NTSTATUS handle_NtUserSetWindowsHookEx();
+    NTSTATUS handle_NtUserUnhookWindowsHookEx();
+    hwnd handle_NtUserCreateWindowEx(const syscall_context& c, DWORD ex_style, emulator_object<LARGE_STRING> class_name,
+                                     emulator_object<LARGE_STRING> cls_version, emulator_object<LARGE_STRING> window_name, DWORD style,
+                                     int x, int y, int width, int height, hwnd parent, hmenu menu, hinstance instance, pointer l_param,
+                                     DWORD flags, pointer acbi_buffer);
+    hwnd completion_NtUserCreateWindowEx(const syscall_context& c, DWORD ex_style, emulator_object<LARGE_STRING> class_name,
+                                         emulator_object<LARGE_STRING> cls_version, emulator_object<LARGE_STRING> window_name, DWORD style,
+                                         int x, int y, int width, int height, hwnd parent, hmenu menu, hinstance instance, pointer l_param,
+                                         DWORD flags, pointer acbi_buffer);
+    BOOL handle_NtUserDestroyWindow(const syscall_context& c, hwnd window);
+    BOOL completion_NtUserDestroyWindow(const syscall_context& c, hwnd window);
+    BOOL handle_NtUserSetProp(const syscall_context& c, hwnd window, uint16_t atom, uint64_t data);
+    BOOL handle_NtUserSetProp2(const syscall_context& c, hwnd window, emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> str,
+                               uint64_t data);
+    uint64_t handle_NtUserChangeWindowMessageFilterEx();
+    BOOL handle_NtUserShowWindow(const syscall_context& c, hwnd hwnd, LONG cmd_show);
+    BOOL completion_NtUserShowWindow(const syscall_context& c, hwnd hwnd, LONG cmd_show);
+    uint64_t handle_NtUserMessageCall(const syscall_context& c, hwnd hwnd, UINT msg, uint64_t w_param, uint64_t l_param,
+                                      uint64_t result_info, DWORD type, BOOL ansi);
+    uint64_t completion_NtUserMessageCall(const syscall_context& c, hwnd hwnd, UINT msg, uint64_t w_param, uint64_t l_param,
+                                          uint64_t result_info, DWORD type, BOOL ansi);
+    BOOL handle_NtUserGetMessage(const syscall_context& c, emulator_object<msg> message, hwnd hwnd, UINT msg_filter_min,
+                                 UINT msg_filter_max);
+    BOOL handle_NtUserPeekMessage(const syscall_context& c, emulator_object<msg> message, hwnd hwnd, UINT msg_filter_min,
+                                  UINT msg_filter_max, UINT remove_message);
+    BOOL handle_NtUserPostMessage(const syscall_context& c, hwnd hwnd, UINT msg, uint64_t wParam, uint64_t lParam);
+    BOOL handle_NtUserPostQuitMessage(const syscall_context& c, int exit_code);
+    NTSTATUS handle_NtUserEnumDisplayDevices(const syscall_context& c, emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> str_device,
+                                             DWORD dev_num, emulator_object<EMU_DISPLAY_DEVICEW> display_device, DWORD flags);
+    NTSTATUS handle_NtUserEnumDisplaySettings(const syscall_context& c, emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> device_name,
+                                              DWORD mode_num, emulator_object<EMU_DEVMODEW> dev_mode, DWORD flags);
+    BOOL handle_NtUserEnumDisplayMonitors(const syscall_context& c, hdc hdc_in, uint64_t clip_rect_ptr, uint64_t callback, uint64_t param);
+    BOOL completion_NtUserEnumDisplayMonitors(const syscall_context& c, hdc hdc_in, uint64_t clip_rect_ptr, uint64_t callback,
+                                              uint64_t param);
+    BOOL handle_NtUserGetHDevName(const syscall_context& c, handle hdev, emulator_pointer device_name);
+    emulator_pointer handle_NtUserMapDesktopObject(const syscall_context& c, handle handle);
+    NTSTATUS handle_NtUserTransformRect();
+    BOOL handle_NtUserSetWindowPos();
+    NTSTATUS handle_NtUserSetForegroundWindow();
+    hwnd handle_NtUserGetForegroundWindow();
+    emulator_pointer handle_NtUserSetWindowLongPtr(const syscall_context& c, handle hWnd, int nIndex, emulator_pointer dwNewLong,
+                                                   BOOL Ansi);
+    uint32_t handle_NtUserSetWindowLong(const syscall_context& c, handle hWnd, int nIndex, uint32_t dwNewLong, BOOL Ansi);
+    uint64_t handle_NtUserGetAncestor(const syscall_context& c, hwnd child_hwnd, UINT flags);
+    BOOL handle_NtUserRedrawWindow();
+    NTSTATUS handle_NtUserGetCPD();
+    NTSTATUS handle_NtUserSetWindowFNID();
+    BOOL handle_NtUserEnableWindow();
+    uint64_t handle_NtUserGetSystemMenu();
+    BOOL handle_NtUserAllowSetForegroundWindow();
+    ULONG handle_NtUserGetAtomName(const syscall_context& c, RTL_ATOM atom,
+                                   emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> atom_name);
+
+    // syscalls/gdi.cpp:
+    NTSTATUS handle_NtGdiInit(const syscall_context& c);
+    NTSTATUS handle_NtGdiInit2(const syscall_context& c);
+    uint32_t handle_NtGdiGetDeviceCaps(const syscall_context& c, hdc dc, uint32_t index);
+    uint32_t handle_NtGdiGetDeviceCapsAll(const syscall_context& c, hdc dc, emulator_pointer caps);
+    uint32_t handle_NtGdiComputeXformCoefficients(const syscall_context& c, hdc dc);
+    uint64_t handle_NtGdiCreateSolidBrush(const syscall_context& c, uint32_t color, uint64_t unused);
+    uint64_t handle_NtGdiCreatePatternBrushInternal(const syscall_context& c, handle bitmap, uint32_t unused);
+    uint64_t handle_NtGdiCreatePen(const syscall_context& c, uint32_t style, uint32_t width, uint32_t color);
+    uint64_t handle_NtGdiCreateCompatibleDC(const syscall_context& c, hdc dc);
+    uint64_t handle_NtGdiCreateCompatibleBitmap(const syscall_context& c, hdc dc, uint32_t width, uint32_t height);
+    uint64_t handle_NtGdiCreateDIBitmapInternal(const syscall_context& c, hdc dc, uint32_t width, uint32_t height, uint32_t usage,
+                                                emulator_pointer bits, emulator_pointer info, uint32_t info_header_size, uint32_t init,
+                                                uint32_t offset, uint32_t cj, uint32_t i_usage);
+    uint32_t handle_NtGdiDeleteObjectApp(const syscall_context& c, uint32_t handle_value);
+    uint64_t handle_NtGdiSelectBitmap(const syscall_context& c, hdc dc, handle bitmap);
+    hdc handle_NtGdiGetDCforBitmap(const syscall_context& c, handle bitmap);
+    uint64_t handle_NtGdiHfontCreate(const syscall_context& c, emulator_pointer logfont, uint32_t angle);
+    uint32_t handle_NtGdiExtGetObjectW(const syscall_context& c, uint32_t handle_value, uint32_t size, emulator_pointer buffer);
+    uint32_t handle_NtGdiEnumFonts();
+    uint32_t handle_NtGdiGetTextCharsetInfo(const syscall_context& c, hdc dc, emulator_pointer sig, uint32_t flags);
+    uint32_t handle_NtGdiQueryFontAssocInfo(const syscall_context& c, hdc dc);
+    uint32_t handle_NtGdiGetTextMetricsW(const syscall_context& c, hdc dc, emulator_pointer ptm, uint32_t cj);
+    NTSTATUS handle_NtGdiGetEntry(const syscall_context& c, uint32_t handle_value, emulator_pointer entry_ptr);
+
+    // syscalls/trace.cpp:
+    NTSTATUS handle_NtTraceControl(const syscall_context& c, ULONG function_code, uint64_t input_buffer, ULONG input_buffer_length,
+                                   uint64_t output_buffer, ULONG output_buffer_length, emulator_object<ULONG> return_length);
+
+    // syscalls/io_completion.cpp:
+    NTSTATUS handle_NtCreateIoCompletion(const syscall_context& c, emulator_object<handle> io_completion_handle, ACCESS_MASK desired_access,
+                                         emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
+                                         ULONG number_of_concurrent_threads);
+    NTSTATUS handle_NtSetIoCompletion(const syscall_context& c, handle io_completion_handle, emulator_pointer key_context,
+                                      emulator_pointer apc_context, NTSTATUS io_status,
+                                      EMULATOR_CAST(EmulatorTraits<Emu64>::ULONG_PTR, ULONG_PTR) io_status_information);
+    NTSTATUS handle_NtSetIoCompletionEx(const syscall_context& c, handle io_completion_handle, handle io_completion_packet_handle,
+                                        emulator_pointer key_context, emulator_pointer apc_context, NTSTATUS io_status,
+                                        EMULATOR_CAST(EmulatorTraits<Emu64>::ULONG_PTR, ULONG_PTR) io_status_information);
+    NTSTATUS handle_NtRemoveIoCompletion(const syscall_context& c, handle io_completion_handle,
+                                         emulator_object<emulator_pointer> key_context, emulator_object<emulator_pointer> apc_context,
+                                         emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
+                                         emulator_object<LARGE_INTEGER> timeout);
+    NTSTATUS handle_NtRemoveIoCompletionEx(const syscall_context& c, handle io_completion_handle,
+                                           emulator_object<FILE_IO_COMPLETION_INFORMATION<EmulatorTraits<Emu64>>> io_completion_information,
+                                           ULONG count, emulator_object<ULONG> num_entries_removed, emulator_object<LARGE_INTEGER> timeout,
+                                           BOOLEAN alertable);
+    NTSTATUS handle_NtCreateWaitCompletionPacket(const syscall_context& c, emulator_object<handle> wait_packet_handle,
+                                                 ACCESS_MASK desired_access,
+                                                 emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes);
+    NTSTATUS handle_NtAssociateWaitCompletionPacket(const syscall_context& c, handle wait_completion_packet_handle,
+                                                    handle io_completion_handle, handle target_object_handle, emulator_pointer key_context,
+                                                    emulator_pointer apc_context, NTSTATUS io_status,
+                                                    EMULATOR_CAST(EmulatorTraits<Emu64>::ULONG_PTR, ULONG_PTR) io_status_information,
+                                                    emulator_object<BOOLEAN> already_signaled);
+    NTSTATUS handle_NtCancelWaitCompletionPacket(const syscall_context& c, handle wait_completion_packet_handle,
+                                                 BOOLEAN remove_signaled_packet);
+
+    // syscalls/worker_factory.cpp:
+    NTSTATUS handle_NtCreateWorkerFactory(const syscall_context& c, emulator_object<handle> worker_factory_handle,
+                                          ACCESS_MASK desired_access,
+                                          emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
+                                          handle io_completion_handle, handle worker_process_handle, emulator_pointer start_routine,
+                                          emulator_pointer start_parameter, ULONG max_thread_count,
+                                          EMULATOR_CAST(EmulatorTraits<Emu64>::SIZE_T, SIZE_T) stack_reserve,
+                                          EMULATOR_CAST(EmulatorTraits<Emu64>::SIZE_T, SIZE_T) stack_commit);
+    NTSTATUS handle_NtWorkerFactoryWorkerReady(const syscall_context& c, handle worker_factory_handle);
+    NTSTATUS handle_NtSetInformationWorkerFactory(const syscall_context& c, handle worker_factory_handle, WORKERFACTORYINFOCLASS info_class,
+                                                  emulator_pointer worker_factory_information, ULONG worker_factory_information_length);
+    NTSTATUS handle_NtShutdownWorkerFactory(const syscall_context& c, handle worker_factory_handle,
+                                            emulator_object<LONG> pending_worker_count);
+    NTSTATUS handle_NtReleaseWorkerFactoryWorker(const syscall_context& c, handle worker_factory_handle);
+    NTSTATUS handle_NtWaitForWorkViaWorkerFactory(const syscall_context& c, handle worker_factory_handle,
+                                                  emulator_object<FILE_IO_COMPLETION_INFORMATION<EmulatorTraits<Emu64>>> mini_packets,
+                                                  ULONG count, emulator_object<ULONG> packets_returned, emulator_pointer deferred_work);
 
     NTSTATUS handle_NtQueryPerformanceCounter(const syscall_context& c, const emulator_object<LARGE_INTEGER> performance_counter,
                                               const emulator_object<LARGE_INTEGER> performance_frequency)
@@ -331,8 +579,9 @@ namespace syscalls
         {
             if (performance_counter)
             {
-                performance_counter.access(
-                    [&](LARGE_INTEGER& value) { value.QuadPart = c.win_emu.clock().steady_now().time_since_epoch().count(); });
+                performance_counter.access([&](LARGE_INTEGER& value) {
+                    value.QuadPart = c.win_emu.clock().steady_now().time_since_epoch().count(); //
+                });
             }
 
             if (performance_frequency)
@@ -355,65 +604,6 @@ namespace syscalls
         return STATUS_NOT_SUPPORTED;
     }
 
-    NTSTATUS handle_NtCreateWorkerFactory()
-    {
-        return STATUS_SUCCESS;
-    }
-
-    NTSTATUS handle_NtSetInformationWorkerFactory()
-    {
-        return STATUS_SUCCESS;
-    }
-
-    NTSTATUS handle_NtShutdownWorkerFactory()
-    {
-        return STATUS_SUCCESS;
-    }
-
-    NTSTATUS handle_NtReleaseWorkerFactoryWorker()
-    {
-        return STATUS_SUCCESS;
-    }
-
-    NTSTATUS handle_NtCreateIoCompletion(const syscall_context& c, const emulator_object<handle> event_handle,
-                                         const ACCESS_MASK desired_access,
-                                         const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
-                                         const uint32_t /*number_of_concurrent_threads*/)
-    {
-        return handle_NtCreateEvent(c, event_handle, desired_access, object_attributes, NotificationEvent, FALSE);
-    }
-
-    NTSTATUS handle_NtSetIoCompletion()
-    {
-        return STATUS_NOT_SUPPORTED;
-    }
-
-    NTSTATUS handle_NtRemoveIoCompletion(const syscall_context&, const emulator_object<handle> /*io_completion__handle*/,
-                                         const emulator_object<int64_t> key_context, const emulator_pointer /*apc_context*/,
-                                         const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> /*io_status_block*/,
-                                         const emulator_object<LARGE_INTEGER> timeout)
-    {
-        if (timeout && timeout.read().QuadPart == 0)
-        {
-            return STATUS_TIMEOUT;
-        }
-
-        key_context.write_if_valid(-1);
-        return STATUS_SUCCESS;
-    }
-
-    NTSTATUS handle_NtRemoveIoCompletionEx()
-    {
-        return STATUS_NOT_SUPPORTED;
-    }
-
-    NTSTATUS handle_NtCreateWaitCompletionPacket(const syscall_context& c, const emulator_object<handle> event_handle,
-                                                 const ACCESS_MASK desired_access,
-                                                 const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes)
-    {
-        return handle_NtCreateEvent(c, event_handle, desired_access, object_attributes, NotificationEvent, FALSE);
-    }
-
     NTSTATUS handle_NtApphelpCacheControl()
     {
         return STATUS_NOT_SUPPORTED;
@@ -431,7 +621,7 @@ namespace syscalls
             return STATUS_INVALID_HANDLE;
         }
 
-        if (auto* e = c.win_emu.process.events.get(event))
+        if (auto* e = c.proc.events.get(event))
         {
             e->signaled = false;
         }
@@ -452,8 +642,7 @@ namespace syscalls
 
     NTSTATUS handle_NtQueryWnfStateData()
     {
-        // puts("NtQueryWnfStateData not supported");
-        return STATUS_NOT_SUPPORTED;
+        return STATUS_SUCCESS;
     }
 
     NTSTATUS handle_NtQueryWnfStateNameInformation()
@@ -461,12 +650,6 @@ namespace syscalls
         // puts("NtQueryWnfStateNameInformation not supported");
         // return STATUS_NOT_SUPPORTED;
         return STATUS_SUCCESS;
-    }
-
-    NTSTATUS handle_NtQueryLicenseValue()
-    {
-        // puts("NtQueryLicenseValue not supported");
-        return STATUS_NOT_SUPPORTED;
     }
 
     NTSTATUS handle_NtTestAlert(const syscall_context& c)
@@ -484,47 +667,6 @@ namespace syscalls
     {
         // puts("NtDxgkIsFeatureEnabled not supported");
         return STATUS_NOT_SUPPORTED;
-    }
-
-    NTSTATUS handle_NtUserDisplayConfigGetDeviceInfo()
-    {
-        // puts("NtUserDisplayConfigGetDeviceInfo not supported");
-        return STATUS_NOT_SUPPORTED;
-    }
-
-    NTSTATUS handle_NtGdiInit(const syscall_context& c)
-    {
-        c.proc.peb.access([&](PEB64& peb) {
-            if (!peb.GdiSharedHandleTable)
-            {
-                const auto shared_memory = c.proc.base_allocator.reserve<GDI_SHARED_MEMORY64>();
-
-                shared_memory.access([](GDI_SHARED_MEMORY64& mem) {
-                    mem.Objects[0x12] = 1;
-                    mem.Objects[0x13] = 1;
-                });
-
-                peb.GdiSharedHandleTable = shared_memory.value();
-            }
-        });
-
-        return STATUS_WAIT_1;
-    }
-
-    NTSTATUS handle_NtGdiInit2(const syscall_context& c)
-    {
-        handle_NtGdiInit(c);
-        return STATUS_NOT_SUPPORTED;
-    }
-
-    NTSTATUS handle_NtUserRegisterWindowMessage()
-    {
-        return STATUS_NOT_SUPPORTED;
-    }
-
-    NTSTATUS handle_NtUserGetThreadState()
-    {
-        return 0;
     }
 
     NTSTATUS handle_NtUpdateWnfStateData()
@@ -594,33 +736,6 @@ namespace syscalls
         return STATUS_SUCCESS;
     }
 
-    NTSTATUS handle_NtUserGetAtomName(const syscall_context& c, const RTL_ATOM atom,
-                                      const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> atom_name)
-    {
-        const auto* name = c.proc.get_atom_name(atom);
-        if (!name)
-        {
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        const size_t name_length = name->size() * 2;
-        const size_t max_length = name_length + 2;
-
-        bool too_small = false;
-        atom_name.access([&](UNICODE_STRING<EmulatorTraits<Emu64>>& str) {
-            if (str.MaximumLength < max_length)
-            {
-                too_small = true;
-                return;
-            }
-
-            str.Length = static_cast<USHORT>(name_length);
-            c.emu.write_memory(str.Buffer, name->data(), max_length);
-        });
-
-        return too_small ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
-    }
-
     NTSTATUS handle_NtQueryDebugFilterState()
     {
         return FALSE;
@@ -631,44 +746,9 @@ namespace syscalls
         return 96;
     }
 
-    hdc handle_NtUserGetDCEx(const syscall_context& /*c*/, const hwnd window, const uint64_t /*clip_region*/, const ULONG /*flags*/)
-    {
-        return window;
-    }
-
-    hdc handle_NtUserGetDC(const syscall_context& c, const hwnd window)
-    {
-        return handle_NtUserGetDCEx(c, window, 0, 0);
-    }
-
-    NTSTATUS handle_NtUserGetWindowDC()
-    {
-        return 1;
-    }
-
-    NTSTATUS handle_NtUserReleaseDC()
-    {
-        return STATUS_SUCCESS;
-    }
-
     NTSTATUS handle_NtUserModifyUserStartupInfoFlags()
     {
         return STATUS_SUCCESS;
-    }
-
-    NTSTATUS handle_NtUserGetCursorPos()
-    {
-        return STATUS_NOT_SUPPORTED;
-    }
-
-    NTSTATUS handle_NtUserSetCursor()
-    {
-        return STATUS_NOT_SUPPORTED;
-    }
-
-    NTSTATUS handle_NtUserFindExistingCursorIcon()
-    {
-        return STATUS_NOT_SUPPORTED;
     }
 
     NTSTATUS handle_NtSystemDebugControl()
@@ -681,62 +761,7 @@ namespace syscalls
         return STATUS_NOT_SUPPORTED;
     }
 
-    NTSTATUS handle_NtTraceControl()
-    {
-        return STATUS_NOT_SUPPORTED;
-    }
-
     NTSTATUS handle_NtUserGetProcessUIContextInformation()
-    {
-        return STATUS_NOT_SUPPORTED;
-    }
-
-    NTSTATUS handle_NtUserFindWindowEx()
-    {
-        return 0;
-    }
-
-    NTSTATUS handle_NtUserMoveWindow()
-    {
-        return 0;
-    }
-
-    NTSTATUS handle_NtUserGetProcessWindowStation()
-    {
-        return 0;
-    }
-
-    template <typename Traits>
-    struct CLSMENUNAME
-    {
-        EMULATOR_CAST(typename Traits::PVOID, char*) pszClientAnsiMenuName;
-        EMULATOR_CAST(typename Traits::PVOID, char16_t*) pwszClientUnicodeMenuName;
-        EMULATOR_CAST(typename Traits::PVOID, UNICODE_STRING*) pusMenuName;
-    };
-
-    NTSTATUS handle_NtUserRegisterClassExWOW(const syscall_context& c, const emulator_pointer /*wnd_class_ex*/,
-                                             const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> class_name,
-                                             const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> /*class_version*/,
-                                             const emulator_object<CLSMENUNAME<EmulatorTraits<Emu64>>> /*class_menu_name*/,
-                                             const DWORD /*function_id*/, const DWORD /*flags*/, const emulator_pointer /*wow*/)
-    {
-        uint16_t index = c.proc.add_or_find_atom(read_unicode_string(c.emu, class_name));
-        return index;
-    }
-
-    NTSTATUS handle_NtUserUnregisterClass(const syscall_context& c, const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> class_name,
-                                          const emulator_pointer /*instance*/,
-                                          const emulator_object<CLSMENUNAME<EmulatorTraits<Emu64>>> /*class_menu_name*/)
-    {
-        return c.proc.delete_atom(read_unicode_string(c.emu, class_name));
-    }
-
-    NTSTATUS handle_NtUserSetWindowsHookEx()
-    {
-        return STATUS_NOT_SUPPORTED;
-    }
-
-    NTSTATUS handle_NtUserUnhookWindowsHookEx()
     {
         return STATUS_NOT_SUPPORTED;
     }
@@ -756,76 +781,6 @@ namespace syscalls
         return 0;
     }
 
-    std::u16string read_large_string(const emulator_object<LARGE_STRING> str_obj)
-    {
-        if (!str_obj)
-        {
-            return {};
-        }
-
-        const auto str = str_obj.read();
-        if (!str.bAnsi)
-        {
-            return read_string<char16_t>(*str_obj.get_memory_interface(), str.Buffer, str.Length / 2);
-        }
-
-        const auto ansi_string = read_string<char>(*str_obj.get_memory_interface(), str.Buffer, str.Length);
-        return u8_to_u16(ansi_string);
-    }
-
-    hwnd handle_NtUserCreateWindowEx(const syscall_context& c, const DWORD /*ex_style*/, const emulator_object<LARGE_STRING> class_name,
-                                     const emulator_object<LARGE_STRING> /*cls_version*/, const emulator_object<LARGE_STRING> window_name,
-                                     const DWORD /*style*/, const int x, const int y, const int width, const int height,
-                                     const hwnd /*parent*/, const hmenu /*menu*/, const hinstance /*instance*/, const pointer /*l_param*/,
-                                     const DWORD /*flags*/, const pointer /*acbi_buffer*/)
-    {
-        window win{};
-        win.x = x;
-        win.y = y;
-        win.width = width;
-        win.height = height;
-        win.thread_id = c.win_emu.current_thread().id;
-        win.class_name = read_large_string(class_name);
-        win.name = read_large_string(window_name);
-
-        return c.proc.windows.store(std::move(win)).bits;
-    }
-
-    BOOL handle_NtUserDestroyWindow(const syscall_context& c, const hwnd window)
-    {
-        return c.proc.windows.erase(window);
-    }
-
-    BOOL handle_NtUserSetProp(const syscall_context& c, const hwnd window, const uint16_t atom, const uint64_t data)
-    {
-        auto* win = c.proc.windows.get(window);
-        const auto* prop = c.proc.get_atom_name(atom);
-
-        if (!win || !prop)
-        {
-            return FALSE;
-        }
-
-        win->props[*prop] = data;
-
-        return TRUE;
-    }
-
-    BOOL handle_NtUserSetProp2(const syscall_context& c, const hwnd window,
-                               const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> str, const uint64_t data)
-    {
-        auto* win = c.proc.windows.get(window);
-        if (!win || !str)
-        {
-            return FALSE;
-        }
-
-        auto prop = read_unicode_string(c.emu, str);
-        win->props[std::move(prop)] = data;
-
-        return TRUE;
-    }
-
     ULONG handle_NtUserGetRawInputDeviceList()
     {
         return 0;
@@ -836,86 +791,43 @@ namespace syscalls
         return 0;
     }
 
-    uint64_t handle_NtUserChangeWindowMessageFilterEx()
-    {
-        return 0;
-    }
-
-    BOOL handle_NtUserShowWindow(const syscall_context& c, const hwnd hwnd, const LONG cmd_show)
-    {
-        (void)c;
-        (void)hwnd;
-        (void)cmd_show;
-        return TRUE;
-    }
-
-    BOOL handle_NtUserGetMessage(const syscall_context& c, const emulator_object<msg> message, const hwnd hwnd, const UINT msg_filter_min,
-                                 const UINT msg_filter_max)
-    {
-        (void)c;
-        (void)message;
-        (void)hwnd;
-        (void)msg_filter_min;
-        (void)msg_filter_max;
-
-        return TRUE;
-    }
-
-    BOOL handle_NtUserPeekMessage(const syscall_context& c, const emulator_object<msg> message, const hwnd hwnd, const UINT msg_filter_min,
-                                  const UINT msg_filter_max, const UINT remove_message)
-    {
-        (void)c;
-        (void)message;
-        (void)hwnd;
-        (void)msg_filter_min;
-        (void)msg_filter_max;
-        (void)remove_message;
-
-        return FALSE;
-    }
-
-    NTSTATUS handle_NtUserEnumDisplayDevices(const syscall_context& /*c*/,
-                                             const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> str_device, const DWORD dev_num,
-                                             const emulator_object<EMU_DISPLAY_DEVICEW> display_device, const DWORD /*flags*/)
-    {
-        if (str_device && dev_num != 0)
-        {
-            return STATUS_UNSUCCESSFUL;
-        }
-
-        if (dev_num > 0)
-        {
-            return STATUS_UNSUCCESSFUL;
-        }
-
-        display_device.access([&](EMU_DISPLAY_DEVICEW& dev) {
-            dev.StateFlags = 0;
-            utils::string::copy(dev.DeviceName, u"\\\\.\\DISPLAY1");
-            utils::string::copy(dev.DeviceID, u"PCI\\VEN_10DE&DEV_0000&SUBSYS_00000000&REV_A1");
-            utils::string::copy(dev.DeviceString, u"Emulator Display");
-            utils::string::copy(dev.DeviceKey, u"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Video\\{00000001-"
-                                               u"0002-0003-0004-000000000005}\\0001");
-        });
-
-        return STATUS_SUCCESS;
-    }
-
-    NTSTATUS handle_NtAssociateWaitCompletionPacket()
+    NTSTATUS handle_NtSubscribeWnfStateChange()
     {
         return STATUS_SUCCESS;
     }
 
-    NTSTATUS handle_NtCancelWaitCompletionPacket()
+    NTSTATUS handle_NtUnsubscribeWnfStateChange()
     {
         return STATUS_SUCCESS;
     }
 
     NTSTATUS handle_NtSetWnfProcessNotificationEvent()
     {
+        return STATUS_SUCCESS;
+    }
+
+    NTSTATUS handle_NtSetInformationDebugObject()
+    {
         return STATUS_NOT_SUPPORTED;
+    }
+
+    NTSTATUS handle_NtRemoveProcessDebug()
+    {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    NTSTATUS handle_NtNotifyChangeDirectoryFileEx()
+    {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    uint64_t handle_NtUserCallNoParam()
+    {
+        return 0;
     }
 }
 
+// NOLINTNEXTLINE(readability-function-size,hicpp-function-size)
 void syscall_dispatcher::add_handlers(std::map<std::string, syscall_handler>& handler_mapping)
 {
 #define add_handler(syscall)                                                            \
@@ -941,19 +853,27 @@ void syscall_dispatcher::add_handlers(std::map<std::string, syscall_handler>& ha
     add_handler(NtQuerySystemInformation);
     add_handler(NtCreateEvent);
     add_handler(NtProtectVirtualMemory);
+    add_handler(NtLockVirtualMemory);
+    add_handler(NtUnlockVirtualMemory);
+    add_handler(NtFlushVirtualMemory);
     add_handler(NtOpenDirectoryObject);
+    add_handler(NtCreateDirectoryObject);
     add_handler(NtTraceEvent);
     add_handler(NtAllocateVirtualMemoryEx);
     add_handler(NtCreateIoCompletion);
     add_handler(NtSetIoCompletion);
+    add_handler(NtSetIoCompletionEx);
     add_handler(NtRemoveIoCompletion);
     add_handler(NtCreateWaitCompletionPacket);
     add_handler(NtCreateWorkerFactory);
+    add_handler(NtWorkerFactoryWorkerReady);
     add_handler(NtSetInformationWorkerFactory);
     add_handler(NtShutdownWorkerFactory);
+    add_handler(NtWaitForWorkViaWorkerFactory);
     add_handler(NtManageHotPatch);
     add_handler(NtOpenSection);
     add_handler(NtMapViewOfSection);
+    add_handler(NtMapViewOfSectionEx);
     add_handler(NtOpenSymbolicLinkObject);
     add_handler(NtQuerySymbolicLinkObject);
     add_handler(NtQuerySystemInformationEx);
@@ -961,25 +881,32 @@ void syscall_dispatcher::add_handlers(std::map<std::string, syscall_handler>& ha
     add_handler(NtQueryVolumeInformationFile);
     add_handler(NtApphelpCacheControl);
     add_handler(NtCreateSection);
+    add_handler(NtQuerySection);
     add_handler(NtConnectPort);
     add_handler(NtSecureConnectPort);
     add_handler(NtCreateFile);
     add_handler(NtDeviceIoControlFile);
     add_handler(NtQueryWnfStateData);
+    add_handler(NtSubscribeWnfStateChange);
     add_handler(NtOpenProcess);
     add_handler(NtOpenProcessToken);
     add_handler(NtOpenProcessTokenEx);
     add_handler(NtQuerySecurityAttributesToken);
+    add_handler(NtAdjustPrivilegesToken);
     add_handler(NtQueryLicenseValue);
     add_handler(NtTestAlert);
     add_handler(NtContinue);
     add_handler(NtContinueEx);
     add_handler(NtTerminateProcess);
+    add_handler(NtFlushProcessWriteBuffers);
     add_handler(NtWriteFile);
+    add_handler(NtLockFile);
+    add_handler(NtUnlockFile);
     add_handler(NtRaiseHardError);
     add_handler(NtCreateSemaphore);
     add_handler(NtOpenSemaphore);
     add_handler(NtReadVirtualMemory);
+    add_handler(NtWriteVirtualMemory);
     add_handler(NtQueryInformationToken);
     add_handler(NtDxgkIsFeatureEnabled);
     add_handler(NtAddAtomEx);
@@ -995,9 +922,33 @@ void syscall_dispatcher::add_handlers(std::map<std::string, syscall_handler>& ha
     add_handler(NtQueryWnfStateNameInformation);
     add_handler(NtAlpcSendWaitReceivePort);
     add_handler(NtGdiInit);
+    add_handler(NtGdiGetDeviceCaps);
+    add_handler(NtGdiGetDeviceCapsAll);
+    add_handler(NtGdiComputeXformCoefficients);
+    add_handler(NtGdiCreateSolidBrush);
+    add_handler(NtGdiCreatePatternBrushInternal);
+    add_handler(NtGdiCreatePen);
+    add_handler(NtGdiCreateCompatibleDC);
+    add_handler(NtGdiCreateCompatibleBitmap);
+    add_handler(NtGdiCreateDIBitmapInternal);
+    add_handler(NtGdiDeleteObjectApp);
+    add_handler(NtGdiSelectBitmap);
+    add_handler(NtGdiGetDCforBitmap);
+    add_handler(NtGdiHfontCreate);
+    add_handler(NtGdiExtGetObjectW);
+    add_handler(NtGdiEnumFonts);
+    add_handler(NtGdiGetTextCharsetInfo);
+    add_handler(NtGdiQueryFontAssocInfo);
+    add_handler(NtGdiGetTextMetricsW);
+    add_handler(NtGdiGetEntry);
     add_handler(NtGdiInit2);
     add_handler(NtUserGetThreadState);
+    add_handler(NtUserProcessConnect);
+    add_handler(NtUserInitializeClientPfnArrays);
+    add_handler(NtUserRemoteConnectState);
+    add_handler(NtUserGetThreadDesktop);
     add_handler(NtOpenKeyEx);
+    add_handler(NtUserTraceLoggingSendMixedModeTelemetry);
     add_handler(NtUserDisplayConfigGetDeviceInfo);
     add_handler(NtOpenEvent);
     add_handler(NtGetMUIRegistryInfo);
@@ -1021,18 +972,25 @@ void syscall_dispatcher::add_handlers(std::map<std::string, syscall_handler>& ha
     add_handler(NtSetInformationFile);
     add_handler(NtUserRegisterWindowMessage);
     add_handler(NtQueryValueKey);
+    add_handler(NtQueryMultipleValueKey);
     add_handler(NtQueryKey);
     add_handler(NtGetNlsSectionPtr);
     add_handler(NtAccessCheck);
     add_handler(NtCreateKey);
+    add_handler(NtSetValueKey);
     add_handler(NtNotifyChangeKey);
     add_handler(NtGetCurrentProcessorNumberEx);
     add_handler(NtGetCurrentProcessorNumber);
     add_handler(NtQueryObject);
+    add_handler(NtCompareObjects);
     add_handler(NtQueryAttributesFile);
     add_handler(NtWaitForMultipleObjects);
+    add_handler(NtWaitForMultipleObjects32);
     add_handler(NtCreateMutant);
     add_handler(NtReleaseMutant);
+    add_handler(NtCreatePrivateNamespace);
+    add_handler(NtOpenPrivateNamespace);
+    add_handler(NtDeletePrivateNamespace);
     add_handler(NtDuplicateToken);
     add_handler(NtQueryTimerResolution);
     add_handler(NtSetInformationKey);
@@ -1050,8 +1008,9 @@ void syscall_dispatcher::add_handlers(std::map<std::string, syscall_handler>& ha
     add_handler(NtReleaseSemaphore);
     add_handler(NtEnumerateKey);
     add_handler(NtEnumerateValueKey);
-    add_handler(NtAlpcConnectPort);
     add_handler(NtAlpcConnectPortEx);
+    add_handler(NtAlpcConnectPort);
+    add_handler(NtAlpcQueryInformation);
     add_handler(NtGetNextThread);
     add_handler(NtSetInformationObject);
     add_handler(NtUserGetCursorPos);
@@ -1064,6 +1023,7 @@ void syscall_dispatcher::add_handlers(std::map<std::string, syscall_handler>& ha
     add_handler(NtRequestWaitReplyPort);
     add_handler(NtQueryDefaultLocale);
     add_handler(NtSetTimerResolution);
+    add_handler(NtSuspendThread);
     add_handler(NtResumeThread);
     add_handler(NtClearEvent);
     add_handler(NtTraceControl);
@@ -1084,6 +1044,7 @@ void syscall_dispatcher::add_handlers(std::map<std::string, syscall_handler>& ha
     add_handler(NtUserUnhookWindowsHookEx);
     add_handler(NtUserCreateWindowEx);
     add_handler(NtUserShowWindow);
+    add_handler(NtUserMessageCall);
     add_handler(NtUserGetMessage);
     add_handler(NtUserPeekMessage);
     add_handler(NtUserMapVirtualKeyEx);
@@ -1092,13 +1053,17 @@ void syscall_dispatcher::add_handlers(std::map<std::string, syscall_handler>& ha
     add_handler(NtUserGetRawInputDeviceList);
     add_handler(NtUserGetKeyboardType);
     add_handler(NtUserEnumDisplayDevices);
+    add_handler(NtUserEnumDisplaySettings);
+    add_handler(NtUserEnumDisplayMonitors);
     add_handler(NtUserSetProp);
     add_handler(NtUserSetProp2);
     add_handler(NtUserChangeWindowMessageFilterEx);
     add_handler(NtUserDestroyWindow);
     add_handler(NtQueryInformationByName);
     add_handler(NtUserSetCursor);
+    add_handler(NtUserGetCursor);
     add_handler(NtOpenMutant);
+    add_handler(NtOpenTimer);
     add_handler(NtCreateTimer);
     add_handler(NtCreateTimer2);
     add_handler(NtSetTimer);
@@ -1108,11 +1073,64 @@ void syscall_dispatcher::add_handlers(std::map<std::string, syscall_handler>& ha
     add_handler(NtAssociateWaitCompletionPacket);
     add_handler(NtCancelWaitCompletionPacket);
     add_handler(NtSetWnfProcessNotificationEvent);
+    add_handler(NtUnsubscribeWnfStateChange);
     add_handler(NtQuerySecurityObject);
     add_handler(NtQueryEvent);
     add_handler(NtRemoveIoCompletionEx);
     add_handler(NtCreateDebugObject);
     add_handler(NtReleaseWorkerFactoryWorker);
+    add_handler(NtAlpcCreateSecurityContext);
+    add_handler(NtAlpcDeleteSecurityContext);
+    add_handler(NtSetSecurityObject);
+    add_handler(NtSetInformationDebugObject);
+    add_handler(NtRemoveProcessDebug);
+    add_handler(NtNotifyChangeDirectoryFileEx);
+    add_handler(NtUserGetHDevName);
+    add_handler(NtFlushInstructionCache);
+    add_handler(NtUserMapDesktopObject);
+    add_handler(NtAlpcSetInformation);
+    add_handler(NtUserTransformRect);
+    add_handler(NtUserSetWindowPos);
+    add_handler(NtUserSetForegroundWindow);
+    add_handler(NtUserGetForegroundWindow);
+    add_handler(NtUserSetWindowLongPtr);
+    add_handler(NtUserSetWindowLong);
+    add_handler(NtUserGetAncestor);
+    add_handler(NtUserPostMessage);
+    add_handler(NtUserRedrawWindow);
+    add_handler(NtUserGetCPD);
+    add_handler(NtUserSetWindowFNID);
+    add_handler(NtUserEnableWindow);
+    add_handler(NtUserGetSystemMenu);
+    add_handler(NtCallbackReturn);
+    add_handler(NtUserPostQuitMessage);
+    add_handler(NtUserGetClassInfoEx);
+    add_handler(NtUserCallNoParam);
 
 #undef add_handler
+}
+
+void syscall_dispatcher::add_callbacks()
+{
+#define add_callback(syscall, completion_state)                                                                                      \
+    do                                                                                                                               \
+    {                                                                                                                                \
+        this->completion_handlers_[callback_id::syscall] = make_syscall_handler<syscalls::completion_##syscall>();                   \
+        syscall_dispatcher::completion_state_factories_[callback_id::syscall] = [] { return std::make_unique<completion_state>(); }; \
+    } while (0)
+
+#define add_stateless_callback(syscall)                                                                            \
+    do                                                                                                             \
+    {                                                                                                              \
+        this->completion_handlers_[callback_id::syscall] = make_syscall_handler<syscalls::completion_##syscall>(); \
+    } while (0)
+
+    add_callback(NtUserCreateWindowEx, window_create_state);
+    add_callback(NtUserDestroyWindow, window_destroy_state);
+    add_callback(NtUserShowWindow, window_show_state);
+    add_stateless_callback(NtUserMessageCall);
+    add_stateless_callback(NtUserEnumDisplayMonitors);
+
+#undef add_callback
+#undef add_stateless_callback
 }

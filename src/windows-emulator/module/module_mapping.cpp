@@ -4,22 +4,32 @@
 
 #include <utils/io.hpp>
 #include <utils/buffer_accessor.hpp>
+#include <utils/string.hpp>
+#include <platform/win_pefile.hpp>
+
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
 
 namespace
 {
-    uint64_t get_first_section_offset(const PENTHeaders_t<std::uint64_t>& nt_headers, const uint64_t nt_headers_offset)
+    bool must_map_module_below_4gb(const std::string& module_name, const PEMachineType machine, const uint64_t image_base)
     {
-        const auto* nt_headers_addr = reinterpret_cast<const uint8_t*>(&nt_headers);
-        const size_t optional_header_offset =
-            reinterpret_cast<uintptr_t>(&(nt_headers.OptionalHeader)) - reinterpret_cast<uintptr_t>(&nt_headers);
-        const size_t optional_header_size = nt_headers.FileHeader.SizeOfOptionalHeader;
-        const auto* first_section_addr = nt_headers_addr + optional_header_offset + optional_header_size;
+        if (machine != PEMachineType::AMD64)
+        {
+            return false;
+        }
 
-        const auto first_section_absolute = reinterpret_cast<uint64_t>(first_section_addr);
-        const auto absolute_base = reinterpret_cast<uint64_t>(&nt_headers);
-        return nt_headers_offset + (first_section_absolute - absolute_base);
+        // wow64 startup needs wow64cpu.dll to be reachable through 32-bit address
+        if (!utils::string::equals_ignore_case(std::string_view{module_name}, std::string_view{"wow64cpu.dll"}))
+        {
+            return false;
+        }
+
+        return image_base > std::numeric_limits<uint32_t>::max();
     }
 
+    template <typename T>
     std::vector<std::byte> read_mapped_memory(const memory_manager& memory, const mapped_module& binary)
     {
         std::vector<std::byte> mem{};
@@ -29,8 +39,9 @@ namespace
         return mem;
     }
 
+    template <typename T>
     void collect_imports(mapped_module& binary, const utils::safe_buffer_accessor<const std::byte> buffer,
-                         const PEOptionalHeader_t<std::uint64_t>& optional_header)
+                         const PEOptionalHeader_t<T>& optional_header)
     {
         const auto& import_directory_entry = optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
         if (import_directory_entry.VirtualAddress == 0 || import_directory_entry.Size == 0)
@@ -48,13 +59,17 @@ namespace
                 break;
             }
 
-            const auto module_name = buffer.as_string(descriptor.Name);
-            auto& imports = binary.imports[module_name];
+            // Use architecture-specific thunk data type
+            using thunk_traits = thunk_data_traits<T>;
+            using thunk_type = typename thunk_traits::type;
 
-            auto original_thunk_data = buffer.as<IMAGE_THUNK_DATA64>(descriptor.FirstThunk);
+            const auto module_index = binary.imported_modules.size();
+            binary.imported_modules.push_back(buffer.as_string(descriptor.Name));
+
+            auto original_thunk_data = buffer.as<thunk_type>(descriptor.FirstThunk);
             if (descriptor.OriginalFirstThunk)
             {
-                original_thunk_data = buffer.as<IMAGE_THUNK_DATA64>(descriptor.OriginalFirstThunk);
+                original_thunk_data = buffer.as<thunk_type>(descriptor.OriginalFirstThunk);
             }
 
             for (size_t j = 0;; ++j)
@@ -65,29 +80,30 @@ namespace
                     break;
                 }
 
-                imported_symbol sym{};
+                static_assert(sizeof(thunk_type) == sizeof(T));
+                const auto thunk_rva = descriptor.FirstThunk + sizeof(thunk_type) * j;
+                const auto thunk_address = thunk_rva + binary.image_base;
 
-                static_assert(sizeof(IMAGE_THUNK_DATA64) == sizeof(uint64_t));
-                const auto thunk_rva = descriptor.FirstThunk + sizeof(IMAGE_THUNK_DATA64) * j;
-                sym.address = thunk_rva + binary.image_base;
+                auto& sym = binary.imports[thunk_address];
+                sym.module_index = module_index;
 
-                if (IMAGE_SNAP_BY_ORDINAL64(original_thunk.u1.Ordinal))
+                // Use architecture-specific ordinal checking
+                if (thunk_traits::snap_by_ordinal(original_thunk.u1.Ordinal))
                 {
-                    sym.name = "#" + std::to_string(IMAGE_ORDINAL64(original_thunk.u1.Ordinal));
+                    sym.name = "#" + std::to_string(thunk_traits::ordinal_mask(original_thunk.u1.Ordinal));
                 }
                 else
                 {
                     sym.name =
                         buffer.as_string(static_cast<size_t>(original_thunk.u1.AddressOfData + offsetof(IMAGE_IMPORT_BY_NAME, Name)));
                 }
-
-                imports.push_back(std::move(sym));
             }
         }
     }
 
+    template <typename T>
     void collect_exports(mapped_module& binary, const utils::safe_buffer_accessor<const std::byte> buffer,
-                         const PEOptionalHeader_t<std::uint64_t>& optional_header)
+                         const PEOptionalHeader_t<T>& optional_header)
     {
         const auto& export_directory_entry = optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
         if (export_directory_entry.VirtualAddress == 0 || export_directory_entry.Size == 0)
@@ -135,8 +151,9 @@ namespace
         obj.set(new_value);
     }
 
+    template <typename T>
     void apply_relocations(const mapped_module& binary, const utils::safe_buffer_accessor<std::byte> buffer,
-                           const PEOptionalHeader_t<std::uint64_t>& optional_header)
+                           const PEOptionalHeader_t<T>& optional_header)
     {
         const auto delta = binary.image_base - optional_header.ImageBase;
         if (delta == 0)
@@ -197,20 +214,22 @@ namespace
         }
     }
 
+    template <typename T>
     void map_sections(memory_manager& memory, mapped_module& binary, const utils::safe_buffer_accessor<const std::byte> buffer,
-                      const PENTHeaders_t<std::uint64_t>& nt_headers, const uint64_t nt_headers_offset)
+                      const PENTHeaders_t<T>& nt_headers, const uint64_t nt_headers_offset)
     {
-        const auto first_section_offset = get_first_section_offset(nt_headers, nt_headers_offset);
+        const auto first_section_offset = winpe::get_first_section_offset(nt_headers, nt_headers_offset);
         const auto sections = buffer.as<IMAGE_SECTION_HEADER>(static_cast<size_t>(first_section_offset));
 
         for (size_t i = 0; i < nt_headers.FileHeader.NumberOfSections; ++i)
         {
             const auto section = sections.get(i);
             const auto target_ptr = binary.image_base + section.VirtualAddress;
+            const auto size_of_section = page_align_up(section.Misc.VirtualSize, nt_headers.OptionalHeader.SectionAlignment);
 
             if (section.SizeOfRawData > 0)
             {
-                const auto size_of_data = std::min(section.SizeOfRawData, section.Misc.VirtualSize);
+                const auto size_of_data = static_cast<size_t>(std::min<uint64_t>(size_of_section, section.SizeOfRawData));
                 const auto* source_ptr = buffer.get_pointer_for_range(section.PointerToRawData, size_of_data);
                 memory.write_memory(target_ptr, source_ptr, size_of_data);
             }
@@ -232,8 +251,6 @@ namespace
                 permissions |= memory_permission::write;
             }
 
-            const auto size_of_section = page_align_up(std::max(section.SizeOfRawData, section.Misc.VirtualSize));
-
             memory.protect_memory(target_ptr, static_cast<size_t>(size_of_section), permissions, nullptr);
 
             mapped_section section_info{};
@@ -251,31 +268,69 @@ namespace
     }
 }
 
-mapped_module map_module_from_data(memory_manager& memory, const std::span<const std::byte> data, std::filesystem::path file)
+template <typename T>
+mapped_module map_module_from_data(memory_manager& memory, const std::span<const std::byte> data, std::filesystem::path file,
+                                   windows_path module_path)
 {
     mapped_module binary{};
     binary.path = std::move(file);
-    binary.name = binary.path.filename().string();
+    binary.name = u16_to_u8(module_path.leaf());
+    binary.module_path = std::move(module_path);
 
     utils::safe_buffer_accessor buffer{data};
 
     const auto dos_header = buffer.as<PEDosHeader_t>(0).get();
     const auto nt_headers_offset = dos_header.e_lfanew;
 
-    const auto nt_headers = buffer.as<PENTHeaders_t<std::uint64_t>>(nt_headers_offset).get();
+    const auto nt_headers = buffer.as<PENTHeaders_t<T>>(nt_headers_offset).get();
     const auto& optional_header = nt_headers.OptionalHeader;
 
-    if (nt_headers.FileHeader.Machine != PEMachineType::AMD64)
+    if (nt_headers.FileHeader.Machine != PEMachineType::I386 && nt_headers.FileHeader.Machine != PEMachineType::AMD64)
     {
         throw std::runtime_error("Unsupported architecture!");
     }
 
     binary.image_base = optional_header.ImageBase;
+    binary.image_base_file = optional_header.ImageBase;
     binary.size_of_image = page_align_up(optional_header.SizeOfImage); // TODO: Sanitize
+
+    const bool force_wow64cpu_32bit_va = must_map_module_below_4gb(binary.name, nt_headers.FileHeader.Machine, binary.image_base);
+
+    if (force_wow64cpu_32bit_va)
+    {
+        binary.image_base = memory.find_free_allocation_base(static_cast<size_t>(binary.size_of_image), DEFAULT_ALLOCATION_ADDRESS_32BIT);
+    }
+
+    // Store PE header fields
+    binary.machine = static_cast<uint16_t>(nt_headers.FileHeader.Machine);
+    binary.size_of_stack_reserve = optional_header.SizeOfStackReserve;
+    binary.size_of_stack_commit = optional_header.SizeOfStackCommit;
+    binary.size_of_heap_reserve = optional_header.SizeOfHeapReserve;
+    binary.size_of_heap_commit = optional_header.SizeOfHeapCommit;
 
     if (!memory.allocate_memory(binary.image_base, static_cast<size_t>(binary.size_of_image), memory_permission::all))
     {
-        binary.image_base = memory.find_free_allocation_base(static_cast<size_t>(binary.size_of_image));
+        // Check if this is a 32-bit module (WOW64)
+        const bool is_32bit = (nt_headers.FileHeader.Machine == PEMachineType::I386);
+
+        if (force_wow64cpu_32bit_va)
+        {
+            binary.image_base =
+                memory.find_free_allocation_base(static_cast<size_t>(binary.size_of_image), DEFAULT_ALLOCATION_ADDRESS_32BIT);
+        }
+        else if (is_32bit)
+        {
+            // Use 32-bit allocation for WOW64 modules
+            binary.image_base =
+                memory.find_free_allocation_base(static_cast<size_t>(binary.size_of_image), DEFAULT_ALLOCATION_ADDRESS_32BIT);
+        }
+        else
+        {
+            // Use 64-bit allocation for native modules
+            binary.image_base =
+                memory.find_free_allocation_base(static_cast<size_t>(binary.size_of_image), DEFAULT_ALLOCATION_ADDRESS_64BIT);
+        }
+
         const auto is_dll = nt_headers.FileHeader.Characteristics & IMAGE_FILE_DLL;
         const auto has_dynamic_base = optional_header.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
         const auto is_relocatable = is_dll || has_dynamic_base;
@@ -295,9 +350,14 @@ mapped_module map_module_from_data(memory_manager& memory, const std::span<const
     const auto* header_buffer = buffer.get_pointer_for_range(0, optional_header.SizeOfHeaders);
     memory.write_memory(binary.image_base, header_buffer, optional_header.SizeOfHeaders);
 
+    const auto image_base = static_cast<T>(binary.image_base);
+    const auto image_base_address =
+        binary.image_base + nt_headers_offset + offsetof(PENTHeaders_t<T>, OptionalHeader) + offsetof(PEOptionalHeader_t<T>, ImageBase);
+    memory.write_memory(image_base_address, &image_base, sizeof(image_base));
+
     map_sections(memory, binary, buffer, nt_headers, nt_headers_offset);
 
-    auto mapped_memory = read_mapped_memory(memory, binary);
+    auto mapped_memory = read_mapped_memory<T>(memory, binary);
     utils::safe_buffer_accessor<std::byte> mapped_buffer{mapped_memory};
 
     apply_relocations(binary, mapped_buffer, optional_header);
@@ -309,7 +369,8 @@ mapped_module map_module_from_data(memory_manager& memory, const std::span<const
     return binary;
 }
 
-mapped_module map_module_from_file(memory_manager& memory, std::filesystem::path file)
+template <typename T>
+mapped_module map_module_from_file(memory_manager& memory, std::filesystem::path file, windows_path module_path)
 {
     const auto data = utils::io::read_file(file);
     if (data.empty())
@@ -317,18 +378,21 @@ mapped_module map_module_from_file(memory_manager& memory, std::filesystem::path
         throw std::runtime_error("Bad file data: " + file.string());
     }
 
-    return map_module_from_data(memory, data, std::move(file));
+    return map_module_from_data<T>(memory, data, std::move(file), std::move(module_path));
 }
 
-mapped_module map_module_from_memory(memory_manager& memory, uint64_t base_address, uint64_t image_size, const std::string& module_name)
+template <typename T>
+mapped_module map_module_from_memory(memory_manager& memory, uint64_t base_address, uint64_t image_size, windows_path module_path)
 {
     mapped_module binary{};
-    binary.name = module_name;
-    binary.path = module_name;
+    binary.name = u16_to_u8(module_path.leaf());
+    binary.path = module_path.to_portable_path();
+    binary.module_path = std::move(module_path);
     binary.image_base = base_address;
+    binary.image_base_file = base_address;
     binary.size_of_image = image_size;
 
-    auto mapped_memory = read_mapped_memory(memory, binary);
+    auto mapped_memory = read_mapped_memory<T>(memory, binary);
     utils::safe_buffer_accessor<const std::byte> buffer{mapped_memory};
 
     try
@@ -340,7 +404,14 @@ mapped_module map_module_from_memory(memory_manager& memory, uint64_t base_addre
 
         binary.entry_point = binary.image_base + optional_header.AddressOfEntryPoint;
 
-        const auto section_offset = get_first_section_offset(nt_headers, nt_headers_offset);
+        // Store PE header fields
+        binary.machine = static_cast<uint16_t>(nt_headers.FileHeader.Machine);
+        binary.size_of_stack_reserve = optional_header.SizeOfStackReserve;
+        binary.size_of_stack_commit = optional_header.SizeOfStackCommit;
+        binary.size_of_heap_reserve = optional_header.SizeOfHeapReserve;
+        binary.size_of_heap_commit = optional_header.SizeOfHeapCommit;
+
+        const auto section_offset = winpe::get_first_section_offset(nt_headers, nt_headers_offset);
         const auto sections = buffer.as<IMAGE_SECTION_HEADER>(static_cast<size_t>(section_offset));
 
         for (size_t i = 0; i < nt_headers.FileHeader.NumberOfSections; ++i)
@@ -381,7 +452,7 @@ mapped_module map_module_from_memory(memory_manager& memory, uint64_t base_addre
     {
         // bad!
         throw std::runtime_error("Failed to map module from memory at " + std::to_string(base_address) + " with size " +
-                                 std::to_string(image_size) + " for module " + module_name);
+                                 std::to_string(image_size) + " for module " + binary.name);
     }
 
     return binary;
@@ -391,3 +462,15 @@ bool unmap_module(memory_manager& memory, const mapped_module& mod)
 {
     return memory.release_memory(mod.image_base, static_cast<size_t>(mod.size_of_image));
 }
+
+template mapped_module map_module_from_data<std::uint32_t>(memory_manager& memory, const std::span<const std::byte> data,
+                                                           std::filesystem::path file, windows_path module_path);
+template mapped_module map_module_from_data<std::uint64_t>(memory_manager& memory, const std::span<const std::byte> data,
+                                                           std::filesystem::path file, windows_path module_path);
+template mapped_module map_module_from_file<std::uint32_t>(memory_manager& memory, std::filesystem::path file, windows_path module_path);
+template mapped_module map_module_from_file<std::uint64_t>(memory_manager& memory, std::filesystem::path file, windows_path module_path);
+
+template mapped_module map_module_from_memory<std::uint32_t>(memory_manager& memory, uint64_t base_address, uint64_t image_size,
+                                                             windows_path module_path);
+template mapped_module map_module_from_memory<std::uint64_t>(memory_manager& memory, uint64_t base_address, uint64_t image_size,
+                                                             windows_path module_path);

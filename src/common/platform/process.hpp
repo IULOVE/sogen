@@ -1,28 +1,33 @@
 #pragma once
 
-// NOLINTBEGIN(modernize-use-using,cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
+// NOLINTBEGIN(modernize-use-using,cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-use-enum-class)
 
 #ifndef OS_WINDOWS
 #define CREATE_SUSPENDED 0x00000004
 #endif
 
-#define CONTEXT_X86_MAIN           0x00010000
-#define CONTEXT_AMD64_MAIN         0x100000
-#define CONTEXT_CONTROL_32         (CONTEXT_X86_MAIN | 0x1L)
-#define CONTEXT_CONTROL_64         (CONTEXT_AMD64_MAIN | 0x1L)
-#define CONTEXT_INTEGER_32         (CONTEXT_X86_MAIN | 0x2L)
-#define CONTEXT_INTEGER_64         (CONTEXT_AMD64_MAIN | 0x2L)
-#define CONTEXT_SEGMENTS_32        (CONTEXT_X86_MAIN | 0x4L)
-#define CONTEXT_SEGMENTS_64        (CONTEXT_AMD64_MAIN | 0x4L)
-#define CONTEXT_FLOATING_POINT_32  (CONTEXT_X86_MAIN | 0x8L)
-#define CONTEXT_FLOATING_POINT_64  (CONTEXT_AMD64_MAIN | 0x8L)
-#define CONTEXT_DEBUG_REGISTERS_32 (CONTEXT_X86_MAIN | 0x10L)
-#define CONTEXT_DEBUG_REGISTERS_64 (CONTEXT_AMD64_MAIN | 0x10L)
-#define CONTEXT_XSTATE_32          (CONTEXT_X86_MAIN | 0x20L)
-#define CONTEXT_XSTATE_64          (CONTEXT_AMD64_MAIN | 0x20L)
+#define CONTEXT_X86_MAIN              0x00010000
+#define CONTEXT_AMD64_MAIN            0x100000
+#define CONTEXT_CONTROL_32            (CONTEXT_X86_MAIN | 0x1L)
+#define CONTEXT_CONTROL_64            (CONTEXT_AMD64_MAIN | 0x1L)
+#define CONTEXT_INTEGER_32            (CONTEXT_X86_MAIN | 0x2L)
+#define CONTEXT_INTEGER_64            (CONTEXT_AMD64_MAIN | 0x2L)
+#define CONTEXT_SEGMENTS_32           (CONTEXT_X86_MAIN | 0x4L)
+#define CONTEXT_SEGMENTS_64           (CONTEXT_AMD64_MAIN | 0x4L)
+#define CONTEXT_FLOATING_POINT_32     (CONTEXT_X86_MAIN | 0x8L)
+#define CONTEXT_FLOATING_POINT_64     (CONTEXT_AMD64_MAIN | 0x8L)
+#define CONTEXT_DEBUG_REGISTERS_32    (CONTEXT_X86_MAIN | 0x10L)
+#define CONTEXT_DEBUG_REGISTERS_64    (CONTEXT_AMD64_MAIN | 0x10L)
+#define CONTEXT_EXTENDED_REGISTERS_32 (CONTEXT_X86_MAIN | 0x20L)
+#define CONTEXT_XSTATE_32             (CONTEXT_X86_MAIN | 0x40L)
+#define CONTEXT_XSTATE_64             (CONTEXT_AMD64_MAIN | 0x40L)
 
 #define CONTEXT64_ALL \
     (CONTEXT_CONTROL_64 | CONTEXT_INTEGER_64 | CONTEXT_SEGMENTS_64 | CONTEXT_FLOATING_POINT_64 | CONTEXT_DEBUG_REGISTERS_64)
+
+#define CONTEXT32_ALL                                                                                                         \
+    (CONTEXT_CONTROL_32 | CONTEXT_INTEGER_32 | CONTEXT_SEGMENTS_32 | CONTEXT_FLOATING_POINT_32 | CONTEXT_DEBUG_REGISTERS_32 | \
+     CONTEXT_EXTENDED_REGISTERS_32)
 
 using SYSTEM_INFORMATION_CLASS = enum _SYSTEM_INFORMATION_CLASS
 {
@@ -762,6 +767,36 @@ typedef struct _SYSTEM_KERNEL_DEBUGGER_INFORMATION
     BOOLEAN KernelDebuggerNotPresent;
 } SYSTEM_KERNEL_DEBUGGER_INFORMATION, *PSYSTEM_KERNEL_DEBUGGER_INFORMATION;
 
+#ifndef OS_WINDOWS
+struct SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES_INFORMATION
+{
+    DWORD Machine : 16;
+    DWORD KernelMode : 1;
+    DWORD UserMode : 1;
+    DWORD Native : 1;
+    DWORD Process : 1;
+    DWORD WoW64Container : 1;
+    DWORD ReservedZero0 : 11;
+};
+
+struct SID_IDENTIFIER_AUTHORITY
+{
+    BYTE Value[6];
+};
+
+#define SID_REVISION                    (1)
+#define SID_MAX_SUB_AUTHORITIES         (15)
+#define SID_RECOMMENDED_SUB_AUTHORITIES (1)
+
+struct SID
+{
+    BYTE Revision;
+    BYTE SubAuthorityCount;
+    SID_IDENTIFIER_AUTHORITY IdentifierAuthority;
+    DWORD SubAuthority[ANYSIZE_ARRAY];
+};
+#endif
+
 struct SID_AND_ATTRIBUTES64
 {
     EMULATOR_CAST(EmulatorTraits<Emu64>::PVOID, PSID) Sid;
@@ -893,6 +928,16 @@ typedef struct _TOKEN_SECURITY_ATTRIBUTES_INFORMATION
     } Attribute;
 } TOKEN_SECURITY_ATTRIBUTES_INFORMATION, *PTOKEN_SECURITY_ATTRIBUTES_INFORMATION;
 
+typedef struct _TOKEN_SECURITY_ATTRIBUTE_V1
+{
+    UNICODE_STRING<EmulatorTraits<Emu64>> Name;
+    USHORT ValueType;
+    USHORT Reserved;
+    ULONG Flags;
+    ULONG ValueCount;
+    uint64_t Values;
+} TOKEN_SECURITY_ATTRIBUTE_V1, *PTOKEN_SECURITY_ATTRIBUTE_V1;
+
 #ifndef OS_WINDOWS
 #define SECURITY_DESCRIPTOR_REVISION  1
 #define SECURITY_DESCRIPTOR_REVISION1 1
@@ -977,62 +1022,16 @@ struct GDI_SHARED_MEMORY64
 
 static_assert(offsetof(GDI_SHARED_MEMORY64, Objects) == 0x1800B0);
 
+struct CLIENT_ID32
+{
+    ULONG UniqueProcess;
+    ULONG UniqueThread;
+};
+
 struct CLIENT_ID64
 {
     DWORD64 UniqueProcess;
     DWORD64 UniqueThread;
-};
-
-struct PORT_MESSAGE64
-{
-    union
-    {
-        struct
-        {
-            CSHORT DataLength;
-            CSHORT TotalLength;
-        } s1;
-
-        ULONG Length;
-    } u1;
-
-    union
-    {
-        struct
-        {
-            CSHORT Type;
-            CSHORT DataInfoOffset;
-        } s2;
-
-        ULONG ZeroInit;
-    } u2;
-
-    union
-    {
-        CLIENT_ID64 ClientId;
-        double DoNotUseThisField;
-    };
-
-    ULONG MessageId;
-
-    union
-    {
-        EmulatorTraits<Emu64>::SIZE_T ClientViewSize; // only valid for LPC_CONNECTION_REQUEST messages
-        ULONG CallbackId;                             // only valid for LPC_REQUEST messages
-    };
-};
-
-struct ALPC_MESSAGE_ATTRIBUTES
-{
-    ULONG AllocatedAttributes;
-    ULONG ValidAttributes;
-};
-
-template <typename Traits>
-struct PORT_DATA_ENTRY
-{
-    typename Traits::PVOID Base;
-    ULONG Size;
 };
 
 template <typename Traits>
@@ -1159,4 +1158,16 @@ struct EMU_SYSTEM_LOGICAL_PROCESSOR_INFORMATION
     } DUMMYUNIONNAME;
 };
 
-// NOLINTEND(modernize-use-using,cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
+struct PROCESS_PRIORITY_CLASS
+{
+    BOOLEAN Foreground;
+    UCHAR PriorityClass;
+};
+
+struct PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION
+{
+    ULONG Version;
+    ULONG Reserved;
+    uint64_t Callback;
+};
+// NOLINTEND(modernize-use-using,cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-use-enum-class)

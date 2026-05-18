@@ -13,30 +13,36 @@ namespace utils::string
 #ifdef __clang__
     __attribute__((__format__(__printf__, 1, 2)))
 #endif
-    const char*
-    va(const char* format, ...);
-
-    template <typename T, size_t Size>
-        requires(std::is_trivially_copyable_v<T>)
-    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
-    void copy(T (&array)[Size], const std::basic_string_view<T> str)
-    {
-        if constexpr (Size == 0)
-        {
-            return;
-        }
-
-        const auto size = std::min(Size, str.size());
-        memcpy(array, str.data(), size * sizeof(T));
-        array[std::min(Size - 1, size)] = {};
-    }
+    const char* va(const char* format, ...);
 
     template <typename T, size_t Size>
         requires(std::is_trivially_copyable_v<T>)
     // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
     void copy(T (&array)[Size], const T* str)
     {
-        copy<T, Size>(array, std::basic_string_view<T>(str));
+        if constexpr (Size == 0)
+        {
+            return;
+        }
+
+        const auto size = std::min(Size, std::char_traits<T>::length(str));
+        memcpy(array, str, size * sizeof(T));
+        array[std::min(Size - 1, size)] = {};
+    }
+
+    template <typename T, size_t Size, class Traits = std::char_traits<T>>
+        requires(std::is_trivially_copyable_v<T>)
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
+    void copy(T (&array)[Size], const std::basic_string_view<T, Traits> str)
+    {
+        if constexpr (Size == 0)
+        {
+            return;
+        }
+
+        const auto size = std::min(Size - 1, str.size());
+        memcpy(array, str.data(), size * sizeof(T));
+        array[size] = {};
     }
 
     inline char char_to_lower(const char val)
@@ -108,6 +114,11 @@ namespace utils::string
         return result;
     }
 
+    inline std::string to_hex_string(const std::string_view str, const bool uppercase = false)
+    {
+        return to_hex_string(str.data(), str.size(), uppercase);
+    }
+
     template <typename Integer>
         requires(std::is_integral_v<Integer>)
     std::string to_hex_number(const Integer& i, const bool uppercase = false)
@@ -160,23 +171,32 @@ namespace utils::string
         return static_cast<std::byte>(0);
     }
 
-    inline std::vector<std::byte> from_hex_string(const std::string_view str)
+    template <typename T>
+        requires std::is_same_v<T, std::vector<std::byte>> || std::is_same_v<T, std::string>
+    constexpr T from_hex_string(const std::string_view str)
     {
+        using value_type = typename T::value_type;
+
         const auto size = str.size() / 2;
 
-        std::vector<std::byte> data{};
+        T data{};
         data.reserve(size);
 
         for (size_t i = 0; i < size; ++i)
         {
-            const auto high = parse_nibble(str[i * 2 + 0]);
-            const auto low = parse_nibble(str[i * 2 + 1]);
-            const auto value = (high << 4) | low;
+            const auto high = parse_nibble(str[(i * 2) + 0]);
+            const auto low = parse_nibble(str[(i * 2) + 1]);
+            const auto value = static_cast<value_type>((high << 4) | low);
 
             data.push_back(value);
         }
 
         return data;
+    }
+
+    constexpr std::vector<std::byte> from_hex_string(const std::string_view str)
+    {
+        return from_hex_string<std::vector<std::byte>>(str);
     }
 
     template <class Elem, class Traits, class Alloc>
@@ -189,5 +209,92 @@ namespace utils::string
     bool equals_ignore_case(const std::basic_string_view<Elem, Traits>& lhs, const std::basic_string_view<Elem, Traits>& rhs)
     {
         return std::ranges::equal(lhs, rhs, [](const auto c1, const auto c2) { return char_to_lower(c1) == char_to_lower(c2); });
+    }
+
+    template <class Elem, class Traits, class Alloc>
+    bool starts_with_ignore_case(const std::basic_string<Elem, Traits, Alloc>& lhs, const std::basic_string<Elem, Traits, Alloc>& rhs)
+    {
+        if (lhs.length() < rhs.length())
+        {
+            return false;
+        }
+
+        return std::ranges::equal(lhs.substr(0, rhs.length()), rhs,
+                                  [](const auto c1, const auto c2) { return char_to_lower(c1) == char_to_lower(c2); });
+    }
+
+    template <class Elem, class Traits>
+    bool starts_with_ignore_case(const std::basic_string_view<Elem, Traits>& lhs, const std::basic_string_view<Elem, Traits>& rhs)
+    {
+        if (lhs.length() < rhs.length())
+        {
+            return false;
+        }
+
+        return std::ranges::equal(lhs.substr(0, rhs.length()), rhs,
+                                  [](const auto c1, const auto c2) { return char_to_lower(c1) == char_to_lower(c2); });
+    }
+
+    template <class Elem, class Traits, class Alloc>
+    bool ends_with_ignore_case(const std::basic_string<Elem, Traits, Alloc>& lhs, const std::basic_string<Elem, Traits, Alloc>& rhs)
+    {
+        if (lhs.length() < rhs.length())
+        {
+            return false;
+        }
+
+        auto start = lhs.length() - rhs.length();
+        return std::ranges::equal(lhs.substr(start, rhs.length()), rhs,
+                                  [](const auto c1, const auto c2) { return char_to_lower(c1) == char_to_lower(c2); });
+    }
+
+    template <class Elem, class Traits>
+    bool ends_with_ignore_case(const std::basic_string_view<Elem, Traits>& lhs, const std::basic_string_view<Elem, Traits>& rhs)
+    {
+        if (lhs.length() < rhs.length())
+        {
+            return false;
+        }
+
+        auto start = lhs.length() - rhs.length();
+        return std::ranges::equal(lhs.substr(start, rhs.length()), rhs,
+                                  [](const auto c1, const auto c2) { return char_to_lower(c1) == char_to_lower(c2); });
+    }
+
+    template <class Elem, class Traits>
+    int compare_ignore_case(std::basic_string_view<Elem, Traits> lhs, std::basic_string_view<Elem, Traits> rhs)
+    {
+        const std::size_t n = std::min(lhs.size(), rhs.size());
+
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            auto c1 = char_to_lower(lhs[i]);
+            auto c2 = char_to_lower(rhs[i]);
+
+            if (c1 < c2)
+            {
+                return -1;
+            }
+            if (c1 > c2)
+            {
+                return 1;
+            }
+        }
+
+        if (lhs.size() < rhs.size())
+        {
+            return -1;
+        }
+        if (lhs.size() > rhs.size())
+        {
+            return 1;
+        }
+        return 0;
+    }
+
+    template <class Elem, class Traits, class Alloc>
+    int compare_ignore_case(const std::basic_string<Elem, Traits, Alloc>& lhs, const std::basic_string<Elem, Traits, Alloc>& rhs)
+    {
+        return compare_ignore_case(std::basic_string_view<Elem, Traits>(lhs), std::basic_string_view<Elem, Traits>(rhs));
     }
 }

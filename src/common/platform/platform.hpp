@@ -17,6 +17,7 @@
 #include "unicode.hpp"
 #include "status.hpp"
 #include "process.hpp"
+#include "user.hpp"
 #include "kernel_mapped.hpp"
 #include "memory.hpp"
 #include "file_management.hpp"
@@ -26,6 +27,8 @@
 #include "network.hpp"
 #include "threading.hpp"
 #include "window.hpp"
+#include "port.hpp"
+#include "namespace.hpp"
 
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop

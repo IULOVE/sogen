@@ -15,10 +15,40 @@ namespace syscalls
             return STATUS_NOT_SUPPORTED;
         }
 
+        const auto return_length_info = c.win_emu.memory.get_region_info(return_length.value());
+
         switch (info_class)
         {
+        case ProcessExecuteFlags:
+            return STATUS_NOT_SUPPORTED;
         case ProcessGroupInformation:
-        case ProcessMitigationPolicy:
+        case ProcessMitigationPolicy: {
+            // ProcessMitigationPolicy requires special handling because the caller
+            // specifies which policy to query via the Policy field in the input buffer.
+            // We need to read this field first to determine what's being queried.
+
+            // Ensure we have at least enough space to read the Policy field
+            if (process_information_length < sizeof(PROCESS_MITIGATION_POLICY))
+            {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+
+            // Read the policy type from the input buffer using safe emulator memory access
+            const emulator_object<PROCESS_MITIGATION_POLICY> policy_obj{c.emu, process_information};
+            const auto policy = policy_obj.read();
+
+            // We only support querying ProcessDynamicCodePolicy
+            if (policy != ProcessDynamicCodePolicy)
+            {
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            return handle_query<PROCESS_MITIGATION_POLICY_RAW_DATA>(c.emu, process_information, process_information_length, return_length,
+                                                                    [policy](PROCESS_MITIGATION_POLICY_RAW_DATA& policy_data) {
+                                                                        policy_data.Policy = policy;
+                                                                        policy_data.Value = 0;
+                                                                    });
+        }
         case ProcessEnclaveInformation:
             return STATUS_NOT_SUPPORTED;
 
@@ -34,6 +64,24 @@ namespace syscalls
             });
 
         case ProcessDebugObjectHandle:
+
+            c.win_emu.callbacks.on_suspicious_activity("Anti-debug check with ProcessDebugObjectHandle");
+
+            if ((process_information & 3) != 0)
+            {
+                return STATUS_DATATYPE_MISALIGNMENT;
+            }
+
+            if (return_length.value() == 0)
+            {
+                return STATUS_PORT_NOT_SET;
+            }
+
+            if (!return_length_info.is_reserved)
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+
             return handle_query<handle>(c.emu, process_information, process_information_length, return_length, [](handle& h) {
                 h = NULL_HANDLE;
                 return STATUS_PORT_NOT_SET;
@@ -47,6 +95,13 @@ namespace syscalls
             });
 
         case ProcessDebugPort:
+            c.win_emu.callbacks.on_suspicious_activity("Anti-debug check with ProcessDebugPort");
+
+            return handle_query<EmulatorTraits<Emu64>::PVOID>(c.emu, process_information, process_information_length, return_length,
+                                                              [](EmulatorTraits<Emu64>::PVOID& ptr) {
+                                                                  ptr = 0; //
+                                                              });
+
         case ProcessDeviceMap:
             return handle_query<EmulatorTraits<Emu64>::PVOID>(c.emu, process_information, process_information_length, return_length,
                                                               [](EmulatorTraits<Emu64>::PVOID& ptr) {
@@ -58,12 +113,35 @@ namespace syscalls
                 b = FALSE; //
             });
 
-        case ProcessBasicInformation:
-            return handle_query<PROCESS_BASIC_INFORMATION64>(c.emu, process_information, process_information_length, return_length,
-                                                             [&](PROCESS_BASIC_INFORMATION64& basic_info) {
-                                                                 basic_info.PebBaseAddress = c.proc.peb.value();
-                                                                 basic_info.UniqueProcessId = 1;
-                                                             });
+        case ProcessPriorityClass:
+            return handle_query<PROCESS_PRIORITY_CLASS>(c.emu, process_information, process_information_length, return_length,
+                                                        [](PROCESS_PRIORITY_CLASS& c) {
+                                                            c.Foreground = 1;
+                                                            c.PriorityClass = 32; // Normal
+                                                        });
+
+        case ProcessBasicInformation: {
+            const auto init_basic_info = [&](PROCESS_BASIC_INFORMATION64& basic_info) {
+                basic_info.PebBaseAddress = c.proc.peb64.value();
+                basic_info.UniqueProcessId = 1;
+            };
+
+            switch (process_information_length)
+            {
+            case sizeof(PROCESS_BASIC_INFORMATION64):
+                return handle_query<PROCESS_BASIC_INFORMATION64>(c.emu, process_information, process_information_length, return_length,
+                                                                 init_basic_info);
+            case sizeof(PROCESS_EXTENDED_BASIC_INFORMATION):
+                return handle_query<PROCESS_EXTENDED_BASIC_INFORMATION>(
+                    c.emu, process_information, process_information_length, return_length,
+                    [&](PROCESS_EXTENDED_BASIC_INFORMATION& ext_basic_info) {
+                        ext_basic_info.Size = sizeof(PROCESS_EXTENDED_BASIC_INFORMATION);
+                        init_basic_info(ext_basic_info.BasicInfo);
+                    });
+            default:
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
 
         case ProcessImageInformation:
             return handle_query<SECTION_IMAGE_INFORMATION<EmulatorTraits<Emu64>>>(
@@ -98,8 +176,34 @@ namespace syscalls
                     i.CheckSum = optional_header.CheckSum;
                 });
 
+        case ProcessVmCounters: {
+            constexpr uint32_t vm_counters_size = 88;
+            constexpr uint32_t vm_counters_ex_size = 96;
+            constexpr uint32_t vm_counters_ex2_size = 112;
+
+            if (process_information_length != vm_counters_size && process_information_length != vm_counters_ex_size &&
+                process_information_length != vm_counters_ex2_size)
+            {
+                if (return_length)
+                {
+                    return_length.write(vm_counters_ex_size);
+                }
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+
+            const std::vector<std::byte> zeroed(process_information_length, std::byte{0});
+            c.emu.write_memory(process_information, zeroed.data(), zeroed.size());
+
+            if (return_length)
+            {
+                return_length.write(process_information_length);
+            }
+
+            return STATUS_SUCCESS;
+        }
+
         case ProcessImageFileNameWin32: {
-            const auto peb = c.proc.peb.read();
+            const auto peb = c.proc.peb64.read();
             emulator_object<RTL_USER_PROCESS_PARAMETERS64> proc_params{c.emu, peb.ProcessParameters};
             const auto params = proc_params.read();
             const auto length = params.ImagePathName.Length + sizeof(UNICODE_STRING<EmulatorTraits<Emu64>>) + 2;
@@ -149,76 +253,167 @@ namespace syscalls
             || info_class == ProcessDefaultHardErrorMode                 //
             || info_class == ProcessRaiseUMExceptionOnInvalidHandleClose //
             || info_class == ProcessDynamicFunctionTableInformation      //
-            || info_class == ProcessPriorityBoost)
+            || info_class == ProcessPriorityBoost                        //
+            || info_class == ProcessPriorityClassEx                      //
+            || info_class == ProcessPriorityClass || info_class == ProcessAffinityMask)
         {
             return STATUS_SUCCESS;
         }
 
+        if (info_class == ProcessExecuteFlags)
+        {
+            return STATUS_NOT_SUPPORTED;
+        }
+
         if (info_class == ProcessTlsInformation)
         {
-            constexpr auto thread_data_offset = offsetof(PROCESS_TLS_INFO, ThreadData);
-            if (process_information_length < thread_data_offset)
+            constexpr auto thread_data_offset = offsetof(PROCESS_TLS_INFORMATION, ThreadData);
+            const auto total_thread_data_size = process_information_length - thread_data_offset;
+
+            if (process_information_length < sizeof(PROCESS_TLS_INFORMATION) || total_thread_data_size % sizeof(THREAD_TLS_INFORMATION))
+            {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+
+            PROCESS_TLS_INFORMATION tls_info{};
+            c.emu.read_memory(process_information, &tls_info, thread_data_offset);
+
+            if (tls_info.OperationType >= MaxProcessTlsOperation || tls_info.Flags & ~PROCESS_TLS_FLAG_VALID_MASK ||
+                tls_info.ThreadDataCount == 0 || total_thread_data_size / sizeof(THREAD_TLS_INFORMATION) != tls_info.ThreadDataCount)
+            {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+
+            auto use_teb32 = false;
+
+            if (tls_info.Flags & PROCESS_TLS_FLAG_USE_TEB32)
+            {
+                if (!c.win_emu.process.is_wow64_process)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                use_teb32 = true;
+            }
+
+            const emulator_object<THREAD_TLS_INFORMATION> data{c.emu, process_information + thread_data_offset};
+
+            for (uint32_t i = 0; i < tls_info.ThreadDataCount; i++)
+            {
+                const auto entry = data.read(i);
+
+                if (entry.Flags)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+            }
+
+            for (size_t i = 0; const auto& cur_thread : c.proc.threads | std::views::values)
+            {
+                if (cur_thread.is_terminated())
+                {
+                    continue;
+                }
+
+                if (i >= tls_info.ThreadDataCount)
+                {
+                    break;
+                }
+
+                size_t pointer_size{};
+                uint64_t tls_vector{};
+                uint64_t tls_vector_address{};
+
+                if (use_teb32)
+                {
+                    pointer_size = sizeof(EmulatorTraits<Emu32>::PVOID);
+                    tls_vector_address = cur_thread.teb32->value() + offsetof(TEB32, ThreadLocalStoragePointer);
+                    cur_thread.teb32->access([&tls_vector](const TEB32& teb32) { tls_vector = teb32.ThreadLocalStoragePointer; });
+                }
+                else
+                {
+                    pointer_size = sizeof(EmulatorTraits<Emu64>::PVOID);
+                    tls_vector_address = cur_thread.teb64->value() + offsetof(TEB64, ThreadLocalStoragePointer);
+                    cur_thread.teb64->access([&tls_vector](const TEB64& teb64) { tls_vector = teb64.ThreadLocalStoragePointer; });
+                }
+
+                if (!tls_vector)
+                {
+                    continue;
+                }
+
+                uint64_t previous_tls_vector = tls_vector;
+                auto entry = data.read(i);
+
+                if (tls_info.OperationType == ProcessTlsReplaceVector)
+                {
+                    const auto new_tls_vector = entry.NewTlsData;
+
+                    if (tls_vector == tls_vector_address)
+                    {
+                        previous_tls_vector = 0;
+                    }
+                    else
+                    {
+                        if ((pointer_size - 1) & tls_vector)
+                        {
+                            return STATUS_DATATYPE_MISALIGNMENT;
+                        }
+
+                        c.emu.move_memory(new_tls_vector, tls_vector, pointer_size * tls_info.PreviousCount);
+                    }
+
+                    if (use_teb32)
+                    {
+                        cur_thread.teb32->access(
+                            [&new_tls_vector](TEB32& teb32) { teb32.ThreadLocalStoragePointer = static_cast<uint32_t>(new_tls_vector); });
+                    }
+                    else
+                    {
+                        cur_thread.teb64->access([&new_tls_vector](TEB64& teb64) { teb64.ThreadLocalStoragePointer = new_tls_vector; });
+                    }
+
+                    cur_thread.teb64->access([&entry](TEB64& teb64) { entry.ThreadId = teb64.ClientId.UniqueThread; });
+                    entry.OldTlsData = previous_tls_vector;
+                }
+                else if (tls_info.OperationType == ProcessTlsReplaceIndex)
+                {
+                    const auto tls_entry_ptr = tls_vector + (tls_info.TlsIndex * pointer_size);
+                    uint64_t old_entry{};
+
+                    if (use_teb32)
+                    {
+                        old_entry = c.emu.read_memory<EmulatorTraits<Emu32>::PVOID>(tls_entry_ptr);
+                        c.emu.write_memory<EmulatorTraits<Emu32>::PVOID>(tls_entry_ptr, static_cast<uint32_t>(entry.NewTlsData));
+                    }
+                    else
+                    {
+                        old_entry = c.emu.read_memory<EmulatorTraits<Emu64>::PVOID>(tls_entry_ptr);
+                        c.emu.write_memory<EmulatorTraits<Emu64>::PVOID>(tls_entry_ptr, entry.NewTlsData);
+                    }
+
+                    entry.OldTlsData = old_entry;
+                }
+
+                entry.Flags = 2;
+                data.write(entry, i++);
+            }
+
+            return STATUS_SUCCESS;
+        }
+
+        if (info_class == ProcessInstrumentationCallback)
+        {
+            if (process_information_length != sizeof(PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION))
             {
                 return STATUS_BUFFER_OVERFLOW;
             }
 
-            const emulator_object<THREAD_TLS_INFO> data{c.emu, process_information + thread_data_offset};
+            PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION info;
 
-            PROCESS_TLS_INFO tls_info{};
-            c.emu.read_memory(process_information, &tls_info, thread_data_offset);
+            c.emu.read_memory(process_information, &info, sizeof(PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION));
+            c.win_emu.callbacks.on_suspicious_activity("Setting ProcessInstrumentationCallback");
 
-            for (uint32_t i = 0; i < tls_info.ThreadDataCount; ++i)
-            {
-                auto entry = data.read(i);
-
-                const auto _ = utils::finally([&] { data.write(entry, i); });
-
-                if (i >= c.proc.threads.size())
-                {
-                    entry.Flags = 0;
-                    continue;
-                }
-
-                auto thread_iterator = c.proc.threads.begin();
-                std::advance(thread_iterator, i);
-
-                entry.Flags = 2;
-
-                thread_iterator->second.teb->access([&](TEB64& teb) {
-                    entry.ThreadId = teb.ClientId.UniqueThread;
-
-                    const auto tls_vector = teb.ThreadLocalStoragePointer;
-                    constexpr auto ptr_size = sizeof(EmulatorTraits<Emu64>::PVOID);
-
-                    if (!tls_vector)
-                    {
-                        return;
-                    }
-
-                    if (tls_info.TlsRequest == ProcessTlsReplaceIndex)
-                    {
-                        const auto tls_entry_ptr = tls_vector + (tls_info.TlsIndex * ptr_size);
-
-                        const auto old_entry = c.emu.read_memory<EmulatorTraits<Emu64>::PVOID>(tls_entry_ptr);
-                        c.emu.write_memory<EmulatorTraits<Emu64>::PVOID>(tls_entry_ptr, entry.TlsModulePointer);
-
-                        entry.TlsModulePointer = old_entry;
-                    }
-                    else if (tls_info.TlsRequest == ProcessTlsReplaceVector)
-                    {
-                        const auto new_tls_vector = entry.TlsVector;
-
-                        for (uint32_t index = 0; index < tls_info.TlsVectorLength; ++index)
-                        {
-                            const auto old_entry = c.emu.read_memory<uint64_t>(tls_vector + index * ptr_size);
-                            c.emu.write_memory(new_tls_vector + index * ptr_size, old_entry);
-                        }
-
-                        teb.ThreadLocalStoragePointer = new_tls_vector;
-                        entry.TlsVector = tls_vector;
-                    }
-                });
-            }
+            c.proc.instrumentation_callback = info.Callback;
 
             return STATUS_SUCCESS;
         }
@@ -276,5 +471,20 @@ namespace syscalls
         }
 
         return STATUS_NOT_SUPPORTED;
+    }
+
+    NTSTATUS handle_NtFlushProcessWriteBuffers(const syscall_context& /*c*/)
+    {
+        return STATUS_SUCCESS;
+    }
+
+    NTSTATUS handle_NtFlushInstructionCache(const syscall_context& c, const handle process_handle,
+                                            const emulator_object<uint64_t> base_address, const uint64_t region_size)
+    {
+        (void)c;
+        (void)process_handle;
+        (void)base_address;
+        (void)region_size;
+        return STATUS_SUCCESS;
     }
 }

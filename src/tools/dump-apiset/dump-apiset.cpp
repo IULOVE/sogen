@@ -21,8 +21,8 @@ int main()
     printf("Dump API-SET\n");
     printf("------------\n\n");
 
-    const auto peb = static_cast<PPEB64>(GetCurrentProcessPeb());
-    const auto api_set_map = reinterpret_cast<API_SET_NAMESPACE*>(peb->ApiSetMap);
+    auto* const peb = static_cast<PPEB64>(GetCurrentProcessPeb());
+    auto* const api_set_map = reinterpret_cast<API_SET_NAMESPACE*>(peb->ApiSetMap);
 
     printf("APISET: 0x%p\n", static_cast<void*>(api_set_map));
     printf("Version: %lu\n", api_set_map->Version);
@@ -32,12 +32,12 @@ int main()
     printf("EntryOffset: %08lX\n", api_set_map->EntryOffset);
     printf("HashOffset: %08lX\n", api_set_map->HashOffset);
     printf("HashFactor: %08lX\n", api_set_map->HashFactor);
-    // print_apiset(apiSetMap);
+    print_apiset(api_set_map);
 
     // Compress the API-SET binary blob
     const auto* data_ptr = reinterpret_cast<const std::byte*>(api_set_map);
     const std::span buffer(data_ptr, data_ptr + api_set_map->Size);
-    const auto compressed = utils::compression::zlib::compress(buffer);
+    const auto compressed = utils::compression::zstd::compress(buffer);
     if (compressed.empty())
     {
         printf("Failed to compress API-SET\n");
@@ -56,8 +56,8 @@ void print_apiset(PAPI_SET_NAMESPACE api_set_map)
 {
     for (ULONG i = 0; i < api_set_map->Count; i++)
     {
-        const auto entry = reinterpret_cast<PAPI_SET_NAMESPACE_ENTRY>(reinterpret_cast<ULONG_PTR>(api_set_map) + api_set_map->EntryOffset +
-                                                                      i * sizeof(API_SET_NAMESPACE_ENTRY));
+        auto* const entry = reinterpret_cast<PAPI_SET_NAMESPACE_ENTRY>(reinterpret_cast<ULONG_PTR>(api_set_map) + api_set_map->EntryOffset +
+                                                                       i * sizeof(API_SET_NAMESPACE_ENTRY));
 
         // printf("  Flags: %08X\n", entry->Flags);
         // printf("  NameOffset: %08X\n", entry->NameOffset);
@@ -72,8 +72,8 @@ void print_apiset(PAPI_SET_NAMESPACE api_set_map)
 
         for (ULONG x = 0; x < entry->ValueCount; x++)
         {
-            const auto value = reinterpret_cast<PAPI_SET_VALUE_ENTRY>(reinterpret_cast<ULONG_PTR>(api_set_map) + entry->ValueOffset +
-                                                                      x * sizeof(API_SET_VALUE_ENTRY));
+            auto* const value = reinterpret_cast<PAPI_SET_VALUE_ENTRY>(reinterpret_cast<ULONG_PTR>(api_set_map) + entry->ValueOffset +
+                                                                       x * sizeof(API_SET_VALUE_ENTRY));
             // printf("  Value %d\n", x);
             // printf("    Flags: %08X\n", value->Flags);
             // printf("    NameOffset: %08X\n", value->NameOffset);
@@ -94,7 +94,7 @@ void print_apiset(PAPI_SET_NAMESPACE api_set_map)
 // Internal
 void create_header_file(const std::vector<uint8_t>& data)
 {
-    FILE* output;
+    FILE* output{};
     (void)fopen_s(&output, "api-set.h", "w");
     if (!output)
     {

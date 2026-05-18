@@ -56,7 +56,9 @@ namespace syscalls
         if (key_information_class == KeyNameInformation)
         {
             auto key_name = (key->hive.get() / key->path.get()).u16string();
-            while (key_name.ends_with(u'/') || key_name.ends_with(u'\\'))
+            std::ranges::replace(key_name, u'/', '\\');
+
+            while (key_name.ends_with(u'\\'))
             {
                 key_name.pop_back();
             }
@@ -84,7 +86,44 @@ namespace syscalls
 
         if (key_information_class == KeyFullInformation)
         {
+            c.win_emu.log.warn("Unsupported registry class: %X\n", key_information_class);
             return STATUS_NOT_SUPPORTED;
+        }
+
+        if (key_information_class == KeyCachedInformation)
+        {
+            auto key_name = (key->hive.get() / key->path.get()).u16string();
+            std::ranges::replace(key_name, u'/', '\\');
+
+            while (key_name.ends_with(u'\\'))
+            {
+                key_name.pop_back();
+            }
+
+            const auto hive_key = c.win_emu.registry.get_hive_key(*key);
+            if (!hive_key.has_value())
+            {
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            }
+
+            constexpr auto required_size = sizeof(KEY_CACHED_INFORMATION);
+            result_length.write(required_size);
+
+            if (required_size > length)
+            {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+
+            KEY_CACHED_INFORMATION info{};
+            info.SubKeys = static_cast<ULONG>(hive_key->key.get_sub_key_count(hive_key->file));
+            info.Values = static_cast<ULONG>(hive_key->key.get_value_count(hive_key->file));
+            info.NameLength = static_cast<ULONG>(key_name.size() * 2);
+            info.MaxValueDataLen = 0x1000;
+            info.MaxValueNameLen = 0x1000;
+            info.MaxNameLen = 0x1000;
+
+            c.emu.write_memory(key_information, info);
+            return STATUS_SUCCESS;
         }
 
         if (key_information_class == KeyHandleTagsInformation)
@@ -98,7 +137,7 @@ namespace syscalls
             }
 
             KEY_HANDLE_TAGS_INFORMATION info{};
-            info.HandleTags = 0; // ?
+            info.HandleTags = key->tag;
 
             const emulator_object<KEY_HANDLE_TAGS_INFORMATION> info_obj{c.emu, key_information};
             info_obj.write(info);
@@ -226,6 +265,86 @@ namespace syscalls
         return STATUS_NOT_SUPPORTED;
     }
 
+    NTSTATUS handle_NtQueryMultipleValueKey(const syscall_context& c, const handle key_handle,
+                                            const emulator_object<KEY_VALUE_ENTRY> value_entries, const ULONG entry_count,
+                                            const uint64_t value_buffer, const emulator_object<ULONG> buffer_length,
+                                            const emulator_object<ULONG> required_buffer_length)
+    {
+        if (entry_count > 0x10000)
+        {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        const auto* key = c.proc.registry_keys.get(key_handle);
+        if (!key)
+        {
+            return STATUS_INVALID_HANDLE;
+        }
+
+        NTSTATUS status = STATUS_SUCCESS;
+        auto remaining_length = buffer_length.read();
+        ULONG required_length = 0;
+        ULONG written_bytes = 0;
+
+        for (ULONG i = 0; i < entry_count; i++)
+        {
+            auto entry = value_entries.read(i);
+            if (!entry.ValueName)
+            {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            const auto query_name = read_unicode_string(c.emu, entry.ValueName);
+
+            if (c.win_emu.callbacks.on_generic_access)
+            {
+                // TODO: Find a better way to log this
+                c.win_emu.callbacks.on_generic_access("Querying multiple value key ", query_name + u" (" + key->to_string() + u")");
+            }
+
+            const auto value = c.win_emu.registry.get_value(*key, u16_to_u8(query_name));
+            if (!value)
+            {
+                status = STATUS_OBJECT_NAME_NOT_FOUND;
+                break;
+            }
+
+            const auto data_length = static_cast<ULONG>(value->data.size());
+
+            if (status == STATUS_SUCCESS)
+            {
+                if (remaining_length >= data_length)
+                {
+                    entry.DataOffset = written_bytes;
+                    entry.DataLength = data_length;
+                    entry.Type = value->type;
+
+                    c.emu.write_memory(value_buffer + entry.DataOffset, value->data.data(), entry.DataLength);
+                    value_entries.write(entry, i);
+
+                    remaining_length -= data_length;
+                    written_bytes += data_length;
+                }
+                else
+                {
+                    status = STATUS_BUFFER_OVERFLOW;
+                }
+            }
+
+            required_length += data_length;
+        }
+
+        buffer_length.write(written_bytes);
+
+        if (required_buffer_length.value())
+        {
+            required_buffer_length.write(required_length);
+        }
+
+        return status;
+    }
+
     NTSTATUS handle_NtCreateKey(const syscall_context& c, const emulator_object<handle> key_handle, const ACCESS_MASK desired_access,
                                 const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
                                 const ULONG /*title_index*/, const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> /*class*/,
@@ -241,14 +360,71 @@ namespace syscalls
         return result;
     }
 
+    NTSTATUS handle_NtSetValueKey(const syscall_context& c, const handle key_handle,
+                                  const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> value_name, const ULONG /*title_index*/,
+                                  const ULONG type, const uint64_t data, const ULONG data_size)
+    {
+        const auto* key = c.proc.registry_keys.get(key_handle);
+        if (!key)
+        {
+            return STATUS_INVALID_HANDLE;
+        }
+
+        std::vector<std::byte> data_buffer{};
+        data_buffer.resize(data_size);
+
+        if (data_size > 0)
+        {
+            if (!data || !c.emu.try_read_memory(data, data_buffer.data(), data_size))
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+        }
+
+        std::string name{};
+        if (value_name.value())
+        {
+            name = u16_to_u8(read_unicode_string(c.emu, value_name));
+        }
+
+        c.win_emu.registry.set_value(*key, std::move(name), type, std::span<const std::byte>{data_buffer});
+
+        return STATUS_SUCCESS;
+    }
+
     NTSTATUS handle_NtNotifyChangeKey()
     {
         return STATUS_SUCCESS;
     }
 
-    NTSTATUS handle_NtSetInformationKey()
+    NTSTATUS handle_NtSetInformationKey(const syscall_context& c, const handle key_handle,
+                                        const KEY_SET_INFORMATION_CLASS key_information_class, const uint64_t key_information,
+                                        const ULONG length)
     {
-        return STATUS_SUCCESS;
+        auto* key = c.proc.registry_keys.get(key_handle);
+        if (!key)
+        {
+            return STATUS_INVALID_HANDLE;
+        }
+
+        if (key_information_class == KeySetHandleTagsInformation)
+        {
+            constexpr auto required_size = sizeof(KEY_HANDLE_TAGS_INFORMATION);
+
+            if (length != required_size)
+            {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+
+            const emulator_object<KEY_HANDLE_TAGS_INFORMATION> info_obj{c.emu, key_information};
+            info_obj.access([&](KEY_HANDLE_TAGS_INFORMATION& info) { key->tag = static_cast<uint16_t>(info.HandleTags); });
+
+            return STATUS_SUCCESS;
+        }
+
+        c.win_emu.log.warn("Unsupported registry information class: %X\n", key_information_class);
+        c.emu.stop();
+        return STATUS_NOT_SUPPORTED;
     }
 
     NTSTATUS handle_NtEnumerateKey(const syscall_context& c, const handle key_handle, const ULONG index,

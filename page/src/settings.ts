@@ -1,9 +1,12 @@
 import { parse } from "shell-quote";
 
+export interface EnvironmentVariable {
+  name: string;
+  value: string;
+}
+
 export interface Settings {
-  verbose: boolean;
-  concise: boolean;
-  silent: boolean;
+  logging: "verbose" | "silent" | "concise" | "very-concise" | string;
   bufferStdout: boolean;
   persist: boolean;
   execAccess: boolean;
@@ -12,6 +15,7 @@ export interface Settings {
   instructionSummary: boolean;
   ignoredFunctions: string[];
   interestingModules: string[];
+  environmentVariables: EnvironmentVariable[];
   commandLine: string;
 }
 
@@ -22,17 +26,16 @@ export interface TranslatedSettings {
 
 export function createDefaultSettings(): Settings {
   return {
-    verbose: false,
-    concise: false,
-    silent: false,
+    logging: "regular",
     bufferStdout: true,
     persist: false,
-    execAccess: true,
+    execAccess: false,
     foreignAccess: false,
     wasm64: false,
     instructionSummary: false,
     ignoredFunctions: [],
     interestingModules: [],
+    environmentVariables: [],
     commandLine: "",
   };
 }
@@ -67,16 +70,22 @@ export function translateSettings(settings: Settings): TranslatedSettings {
   const switches: string[] = [];
   const options: string[] = [];
 
-  if (settings.verbose) {
-    switches.push("-v");
-  }
+  switch (settings.logging) {
+    case "verbose":
+      switches.push("-v");
+      break;
+    case "silent":
+      switches.push("-s");
+      break;
+    case "concise":
+      switches.push("-c");
+      break;
+    case "very-concise":
+      switches.push("-vc");
+      break;
 
-  if (settings.concise) {
-    switches.push("-c");
-  }
-
-  if (settings.silent) {
-    switches.push("-s");
+    default:
+      break;
   }
 
   if (settings.bufferStdout) {
@@ -103,6 +112,17 @@ export function translateSettings(settings: Settings): TranslatedSettings {
   settings.interestingModules.forEach((m) => {
     switches.push("-m");
     switches.push(m);
+  });
+
+  settings.environmentVariables.forEach((variable) => {
+    const name = variable.name.trim();
+    if (!name) {
+      return;
+    }
+
+    switches.push("--env");
+    switches.push(name);
+    switches.push(variable.value);
   });
 
   try {

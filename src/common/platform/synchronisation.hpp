@@ -1,6 +1,6 @@
 #pragma once
 
-// NOLINTBEGIN(modernize-use-using)
+// NOLINTBEGIN(modernize-use-using,cppcoreguidelines-use-enum-class)
 
 typedef enum _EVENT_TYPE
 {
@@ -17,4 +17,10 @@ typedef enum _WAIT_TYPE
     WaitDpc,
 } WAIT_TYPE;
 
-// NOLINTEND(modernize-use-using)
+struct EVENT_BASIC_INFORMATION
+{
+    EVENT_TYPE EventType;
+    LONG EventState;
+};
+
+// NOLINTEND(modernize-use-using,cppcoreguidelines-use-enum-class)

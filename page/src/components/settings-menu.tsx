@@ -3,6 +3,7 @@ import { Checkbox } from "./ui/checkbox";
 import { Label } from "./ui/label";
 
 import { Settings } from "@/settings";
+import { EnvironmentVariableList } from "./environment-variable-list";
 import { TextTooltip } from "./text-tooltip";
 import { ItemList } from "./item-list";
 
@@ -13,6 +14,7 @@ import {
 } from "@/components/ui/popover";
 import { ChevronDown } from "react-bootstrap-icons";
 import { Input } from "./ui/input";
+import { RadioGroup, RadioGroupItem } from "./ui/radio-group";
 
 interface SettingsMenuProps {
   settings: Settings;
@@ -61,69 +63,68 @@ export class SettingsMenu extends React.Component<SettingsMenuProps, Settings> {
 
   render() {
     return (
-      <div className="grid gap-4">
-        <div className="space-y-2">
+      <div className="grid gap-3">
+        <div className="space-y-2 mb-1">
           <h4 className="font-medium leading-none">Settings</h4>
           <p className="text-sm text-muted-foreground">
             Set the settings for the emulation.
           </p>
         </div>
 
-        <div className="flex gap-6">
-          <Input
-            id="settings-argv"
-            placeholder="Command-Line Arguments"
-            value={this.state.commandLine}
-            onChange={(e) => this.updateArgv(e.target.value)}
-          />
+        <div className="flex gap-6 mb-2">
+          <RadioGroup
+            defaultValue="regular"
+            value={this.state.logging}
+            onValueChange={(value) => this.setState({ logging: value })}
+          >
+            <div className="flex items-center gap-4">
+              <RadioGroupItem value="regular" id="settings-regular" />
+              <SettingsLabel
+                htmlFor="settings-regular"
+                text={"Regular Logging"}
+                tooltip={
+                  "Default logging behaviour, not too verbose, but also not very concise"
+                }
+              />
+            </div>
+            <div className="flex items-center gap-4">
+              <RadioGroupItem value="verbose" id="settings-verbose" />
+              <SettingsLabel
+                htmlFor="settings-verbose"
+                text={"Verbose Logging"}
+                tooltip={
+                  "Very detailed logging of all function calls and accesses"
+                }
+              />
+            </div>
+            <div className="flex items-center gap-4">
+              <RadioGroupItem value="concise" id="settings-concise" />
+              <SettingsLabel
+                htmlFor="settings-concise"
+                text={"Concise Logging"}
+                tooltip={"Suppress logging until the application code runs"}
+              />
+            </div>
+            <div className="flex items-center gap-4">
+              <RadioGroupItem value="very-concise" id="settings-very-concise" />
+              <SettingsLabel
+                htmlFor="settings-very-concise"
+                text={"Very Concise Logging"}
+                tooltip={"Suppress all logging except suspicious activity"}
+              />
+            </div>
+            <div className="flex items-center gap-4">
+              <RadioGroupItem value="silent" id="settings-silent" />
+              <SettingsLabel
+                htmlFor="settings-silent"
+                text={"Silent Logging"}
+                tooltip={"Suppress all logging except for stdout"}
+              />
+            </div>
+          </RadioGroup>
         </div>
 
-        <div className="flex gap-6">
-          <Checkbox
-            id="settings-verbose"
-            checked={this.state.verbose}
-            onCheckedChange={(checked: boolean) => {
-              this.setState({ verbose: checked });
-            }}
-          />
-          <SettingsLabel
-            htmlFor="settings-verbose"
-            text={"Verbose Logging"}
-            tooltip={"Very detailed logging of all function call and accesses"}
-          />
-        </div>
-
-        <div className="flex gap-6">
-          <Checkbox
-            id="settings-concise"
-            checked={this.state.concise}
-            onCheckedChange={(checked: boolean) => {
-              this.setState({ concise: checked });
-            }}
-          />
-          <SettingsLabel
-            htmlFor="settings-concise"
-            text={"Concise Logging"}
-            tooltip={"Suppress logging until the application code runs"}
-          />
-        </div>
-
-        <div className="flex gap-6">
-          <Checkbox
-            id="settings-silent"
-            checked={this.state.silent}
-            onCheckedChange={(checked: boolean) => {
-              this.setState({ silent: checked });
-            }}
-          />
-          <SettingsLabel
-            htmlFor="settings-silent"
-            text={"Silent Logging"}
-            tooltip={"Suppress all logging except for stdout"}
-          />
-        </div>
-
-        <div className="flex gap-6">
+        <div className="flex gap-4">
           <Checkbox
             id="settings-buffer"
             checked={this.state.bufferStdout}
@@ -140,7 +141,7 @@ export class SettingsMenu extends React.Component<SettingsMenuProps, Settings> {
           />
         </div>
 
-        <div className="flex gap-6">
+        <div className="flex gap-4">
           <Checkbox
             id="settings-exec"
             checked={this.state.execAccess}
@@ -155,7 +156,7 @@ export class SettingsMenu extends React.Component<SettingsMenuProps, Settings> {
           />
         </div>
 
-        <div className="flex gap-6">
+        <div className="flex gap-4">
           <Checkbox
             id="settings-foreign"
             checked={this.state.foreignAccess}
@@ -172,7 +173,7 @@ export class SettingsMenu extends React.Component<SettingsMenuProps, Settings> {
           />
         </div>
 
-        <div className="flex gap-6">
+        <div className="flex gap-4">
           <Checkbox
             id="settings-summary"
             checked={this.state.instructionSummary}
@@ -187,7 +188,7 @@ export class SettingsMenu extends React.Component<SettingsMenuProps, Settings> {
           />
         </div>
 
-        <div className="flex gap-6">
+        <div className="flex gap-4">
           <Checkbox
             id="settings-persist"
             checked={this.state.persist}
@@ -204,7 +205,7 @@ export class SettingsMenu extends React.Component<SettingsMenuProps, Settings> {
           />
         </div>
 
-        <div className="flex gap-6">
+        <div className="flex gap-4">
           <Checkbox
             id="settings-mem64"
             disabled={!this.props.allowWasm64}
@@ -222,10 +223,40 @@ export class SettingsMenu extends React.Component<SettingsMenuProps, Settings> {
           />
         </div>
 
+        <div className="flex gap-6 my-2">
+          <Input
+            id="settings-argv"
+            placeholder="Command-Line Arguments"
+            value={this.state.commandLine}
+            onChange={(e) => this.updateArgv(e.target.value)}
+          />
+        </div>
+
+        <Popover>
+          <PopoverTrigger>
+            <div className="w-full">
+              <div className="flex items-center mb-2">
+                <Label className="flex-1 text-left cursor-pointer">
+                  Environment Variables
+                </Label>
+                <ChevronDown />
+              </div>
+            </div>
+          </PopoverTrigger>
+          <PopoverContent className="shadow-2xl">
+            <EnvironmentVariableList
+              items={this.state.environmentVariables}
+              onChange={(items) =>
+                this.setState({ environmentVariables: items })
+              }
+            />
+          </PopoverContent>
+        </Popover>
+
         <Popover>
           <PopoverTrigger>
             <TextTooltip tooltip="Don't log executions of listed functions">
-              <div className="flex items-center">
+              <div className="flex items-center mb-2">
                 <Label className="flex-1 text-left cursor-pointer">
                   Ignored Functions
                 </Label>
@@ -236,6 +267,7 @@ export class SettingsMenu extends React.Component<SettingsMenuProps, Settings> {
           <PopoverContent className="shadow-2xl">
             <ItemList
               title="Ignored Functions"
+              trim
               items={this.state.ignoredFunctions}
               onChange={(items) => this.setState({ ignoredFunctions: items })}
             />
@@ -245,7 +277,7 @@ export class SettingsMenu extends React.Component<SettingsMenuProps, Settings> {
         <Popover>
           <PopoverTrigger>
             <TextTooltip tooltip="Log interactions of additional modules">
-              <div className="flex items-center">
+              <div className="flex items-center mb-1">
                 <Label className="flex-1 text-left cursor-pointer">
                   Interesting Modules
                 </Label>
@@ -256,6 +288,7 @@ export class SettingsMenu extends React.Component<SettingsMenuProps, Settings> {
           <PopoverContent className="shadow-2xl">
             <ItemList
               title="Interesting Modules"
+              trim
               items={this.state.interestingModules}
               onChange={(items) => this.setState({ interestingModules: items })}
             />

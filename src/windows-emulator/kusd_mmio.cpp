@@ -1,7 +1,9 @@
 #include "std_include.hpp"
 #include "kusd_mmio.hpp"
 #include <utils/time.hpp>
+#include <utils/string.hpp>
 #include "windows_emulator.hpp"
+#include "version/windows_version_manager.hpp"
 
 #include <address_utils.hpp>
 
@@ -11,7 +13,7 @@ constexpr auto KUSD_BUFFER_SIZE = page_align_up(KUSD_SIZE);
 
 namespace
 {
-    void setup_kusd(KUSER_SHARED_DATA64& kusd)
+    void setup_kusd(KUSER_SHARED_DATA64& kusd, const windows_version_manager& version, const fake_environment_config& fake_env)
     {
         memset(reinterpret_cast<void*>(&kusd), 0, sizeof(kusd));
 
@@ -29,11 +31,12 @@ namespace
         kusd.LargePageMinimum = 0x00200000;
         kusd.RNGSeedVersion = 0;
         kusd.TimeZoneBiasStamp = 0x00000004;
-        kusd.NtBuildNumber = 19045;
-        kusd.NtProductType = NtProductWinNt;
+        kusd.NtBuildNumber = version.get_windows_build_number();
+        kusd.NtProductType = static_cast<NT_PRODUCT_TYPE>(fake_env.nt_product_type);
         kusd.ProductTypeIsValid = 0x01;
         kusd.NativeProcessorArchitecture = 0x0009;
-        kusd.NtMajorVersion = 0x0000000a;
+        kusd.NtMajorVersion = version.get_major_version();
+        kusd.NtMinorVersion = version.get_minor_version();
         kusd.BootId = 0;
         kusd.SystemExpirationDate.QuadPart = 0;
         kusd.SuiteMask = 0;
@@ -51,8 +54,10 @@ namespace
         kusd.Cookie = 0;
         kusd.ConsoleSessionForegroundProcessId = 0x00000000000028f4;
         kusd.TimeUpdateLock = 0x0000000002b28586;
-        kusd.BaselineSystemTimeQpc = 0x0000004b17cd596c;
-        kusd.BaselineInterruptTimeQpc = 0x0000004b17cd596c;
+        // This is the QPC time when `SystemTime` is set
+        // We set it to UINT64_MAX, so `SystemTime` won't get adjusted in `RtlGetSystemTimePrecise`
+        kusd.BaselineSystemTimeQpc = 0xFFFFFFFFFFFFFFFF;
+        kusd.BaselineInterruptTimeQpc = 0xFFFFFFFFFFFFFFFF;
         kusd.QpcSystemTimeIncrement = 0x8000000000000000;
         kusd.QpcInterruptTimeIncrement = 0x8000000000000000;
         kusd.QpcSystemTimeIncrementShift = 0x01;
@@ -72,11 +77,16 @@ namespace
         kusd.QpcData.QpcBypassEnabled = 0x83;
         kusd.QpcBias = 0x000000159530c4af;
         kusd.QpcFrequency = utils::clock::steady_duration::period::den;
+        kusd.Reserved1 = 0x7ffeffff;
+        kusd.Reserved3 = 0x80000000;
+        kusd.ProcessorFeatures.arr[PF_RDTSC_INSTRUCTION_AVAILABLE] = 1;
+        kusd.ProcessorFeatures.arr[PF_RDTSCP_INSTRUCTION_AVAILABLE] = 1;
+        kusd.ProcessorFeatures.arr[PF_RDPID_INSTRUCTION_AVAILABLE] = 0;
 
-        constexpr std::u16string_view root_dir{u"C:\\WINDOWS"};
-        memcpy(&kusd.NtSystemRoot.arr[0], root_dir.data(), root_dir.size() * 2);
+        const auto& system_root = version.get_system_root();
+        utils::string::copy(kusd.NtSystemRoot.arr, std::u16string_view{system_root.u16string()});
 
-        kusd.ImageNumberLow = IMAGE_FILE_MACHINE_I386;
+        kusd.ImageNumberLow = IMAGE_FILE_MACHINE_AMD64;
         kusd.ImageNumberHigh = IMAGE_FILE_MACHINE_AMD64;
     }
 }
@@ -111,9 +121,9 @@ kusd_mmio::kusd_mmio(utils::buffer_deserializer& buffer)
 {
 }
 
-void kusd_mmio::setup()
+void kusd_mmio::setup(const windows_version_manager& version, const fake_environment_config& fake_env)
 {
-    setup_kusd(this->kusd_);
+    setup_kusd(this->kusd_, version, fake_env);
     this->register_mmio();
 }
 
@@ -156,6 +166,17 @@ void kusd_mmio::update()
 {
     const auto time = this->clock_->system_now();
     utils::convert_to_ksystem_time(&this->kusd_.SystemTime, time);
+
+    const auto ticks = this->clock_->steady_now();
+    const auto duration_100ns =
+        std::chrono::duration_cast<std::chrono::duration<uint64_t, std::ratio<1, 10000000>>>(ticks.time_since_epoch()).count();
+
+    this->kusd_.TickCount.TickCountQuad = (duration_100ns << 24) / this->kusd_.TickCountMultiplier;
+    this->kusd_.TickCount.TickCount.High2Time = this->kusd_.TickCount.TickCount.High1Time;
+
+    this->kusd_.InterruptTime.High2Time = static_cast<int32_t>(duration_100ns >> 32);
+    this->kusd_.InterruptTime.LowPart = static_cast<uint32_t>(duration_100ns & 0xFFFFFFFF);
+    this->kusd_.InterruptTime.High1Time = static_cast<int32_t>(duration_100ns >> 32);
 }
 
 void kusd_mmio::register_mmio()

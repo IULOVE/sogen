@@ -4,29 +4,99 @@
 #include "mapped_module.hpp"
 #include "../file_system.hpp"
 #include <utils/function.hpp>
+#include "platform/win_pefile.hpp"
 
 class logger;
+class registry_manager;
+class windows_version_manager;
+struct process_context;
+
+// Execution mode for the emulated process
+enum class execution_mode
+{
+    native_64bit, // Native 64-bit execution
+    wow64_32bit,  // WOW64 mode for 32-bit applications
+    unknown       // Detection failed or unsupported
+};
+
+// PE architecture detection result
+struct pe_detection_result
+{
+    winpe::pe_arch architecture;
+    execution_mode suggested_mode;
+    std::string error_message;
+
+    bool is_valid() const
+    {
+        return error_message.empty();
+    }
+};
+
+class module_mapping_strategy
+{
+  public:
+    virtual ~module_mapping_strategy() = default;
+    virtual mapped_module map_from_file(memory_manager& memory, std::filesystem::path file, windows_path module_path) = 0;
+    virtual mapped_module map_from_memory(memory_manager& memory, uint64_t base_address, uint64_t image_size, windows_path module_path) = 0;
+};
+
+class pe32_mapping_strategy : public module_mapping_strategy
+{
+  public:
+    mapped_module map_from_file(memory_manager& memory, std::filesystem::path file, windows_path module_path) override;
+    mapped_module map_from_memory(memory_manager& memory, uint64_t base_address, uint64_t image_size, windows_path module_path) override;
+};
+
+class pe64_mapping_strategy : public module_mapping_strategy
+{
+  public:
+    mapped_module map_from_file(memory_manager& memory, std::filesystem::path file, windows_path module_path) override;
+    mapped_module map_from_memory(memory_manager& memory, uint64_t base_address, uint64_t image_size, windows_path module_path) override;
+};
+
+class mapping_strategy_factory
+{
+  private:
+    std::unique_ptr<pe32_mapping_strategy> pe32_strategy_;
+    std::unique_ptr<pe64_mapping_strategy> pe64_strategy_;
+
+  public:
+    mapping_strategy_factory();
+    module_mapping_strategy& get_strategy(winpe::pe_arch arch);
+};
+
+class pe_architecture_detector
+{
+  public:
+    static pe_detection_result detect_from_file(const std::filesystem::path& file);
+    static pe_detection_result detect_from_memory(uint64_t base_address, uint64_t image_size);
+    static execution_mode determine_execution_mode(winpe::pe_arch executable_arch);
+};
 
 class module_manager
 {
   public:
     struct callbacks
     {
-        utils::optional_function<void(mapped_module& mod)> on_module_load{};
-        utils::optional_function<void(mapped_module& mod)> on_module_unload{};
+        utils::callback_list<void(mapped_module& mod)> on_module_load{};
+        utils::callback_list<void(mapped_module& mod)> on_module_unload{};
     };
 
     using module_map = std::map<uint64_t, mapped_module>;
 
     module_manager(memory_manager& memory, file_system& file_sys, callbacks& cb);
 
-    void map_main_modules(const windows_path& executable_path, const windows_path& ntdll_path, const windows_path& win32u_path,
+    void map_main_modules(const windows_path& executable_path, windows_version_manager& version, process_context& context,
                           const logger& logger);
 
-    mapped_module* map_module(const windows_path& file, const logger& logger, bool is_static = false);
-    mapped_module* map_local_module(const std::filesystem::path& file, const logger& logger, bool is_static = false);
-    mapped_module* map_memory_module(uint64_t base_address, uint64_t image_size, const std::string& module_name, const logger& logger,
-                                     bool is_static = false);
+    std::optional<uint64_t> get_module_load_count_by_path(const windows_path& path);
+    mapped_module* map_module(windows_path file, const logger& logger, bool is_static = false, bool allow_duplicate = false);
+    mapped_module* map_module_or_throw(const windows_path& file, const logger& logger, bool is_static = false,
+                                       bool allow_duplicate = false);
+    mapped_module* map_local_module(const std::filesystem::path& file, windows_path module_path, const logger& logger,
+                                    bool is_static = false, bool allow_duplicate = false);
+    mapped_module* map_memory_module(uint64_t base_address, uint64_t image_size, windows_path module_path, const logger& logger,
+                                     bool is_static = false, bool allow_duplicate = false);
 
     mapped_module* find_by_address(const uint64_t address)
     {
@@ -72,10 +142,30 @@ class module_manager
         return modules_;
     }
 
-    // TODO: These is wrong here. A good mechanism for quick module access is needed.
+    // Execution mode accessors
+    execution_mode get_execution_mode() const
+    {
+        return current_execution_mode_;
+    }
+    bool is_wow64_process() const
+    {
+        return current_execution_mode_ == execution_mode::wow64_32bit;
+    }
+
+    // TODO: These should be properly encapsulated. A good mechanism for quick module access is needed.
     mapped_module* executable{};
     mapped_module* ntdll{};
     mapped_module* win32u{};
+    std::map<std::filesystem::path, uint64_t> modules_load_count;
+
+    // WOW64-specific modules (for validation and future use)
+    struct wow64_modules
+    {
+        mapped_module* ntdll32 = nullptr;      // 32-bit ntdll.dll
+        mapped_module* wow64_dll = nullptr;    // wow64.dll (loaded by system)
+        mapped_module* wow64win_dll = nullptr; // wow64win.dll (loaded by system)
+        // Note: wow64cpu.dll is loaded by ntdll via registry lookup, not managed here
+    } wow64_modules_;
 
   private:
     memory_manager* memory_{};
@@ -83,9 +173,30 @@ class module_manager
     callbacks* callbacks_{};
 
     module_map modules_{};
+    mutable module_map::iterator last_module_cache_{modules_.end()};
+
+    mapping_strategy_factory strategy_factory_;
+    execution_mode current_execution_mode_ = execution_mode::unknown;
+
+    mapped_module* map_module_core(const pe_detection_result& detection_result, const std::function<mapped_module()>& mapper,
+                                   const logger& logger, bool is_static);
+
+    execution_mode detect_execution_mode(const windows_path& executable_path, const logger& logger);
+
+    void load_native_64bit_modules(const windows_path& executable_path, const windows_path& ntdll_path, const windows_path& win32u_path,
+                                   const logger& logger);
+    void load_wow64_modules(const windows_path& executable_path, const windows_path& ntdll_path, const windows_path& win32u_path,
+                            const windows_path& ntdll32_path, windows_version_manager& version, const logger& logger);
+
+    void install_wow64_heaven_gate(const logger& logger);
 
     module_map::iterator get_module(const uint64_t address)
     {
+        if (last_module_cache_ != this->modules_.end() && last_module_cache_->second.contains(address))
+        {
+            return last_module_cache_;
+        }
+
         if (this->modules_.empty())
         {
             return this->modules_.end();
@@ -99,8 +210,9 @@ class module_manager
 
         std::advance(upper_bound, -1);
 
-        if (upper_bound->second.is_within(address))
+        if (upper_bound->second.contains(address))
         {
+            last_module_cache_ = upper_bound;
             return upper_bound;
         }
 
