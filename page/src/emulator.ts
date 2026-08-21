@@ -1,9 +1,10 @@
-import { Settings, translateSettings } from "./settings";
+import { Settings, EmulatorMode, translateSettings } from "./settings";
 
 import * as flatbuffers from "flatbuffers";
 import * as fbDebugger from "@/fb/debugger";
 
 type LogHandler = (lines: string[]) => void;
+export type UiMessageHandler = (message: unknown) => void;
 
 export enum EmulationState {
   Stopped,
@@ -50,8 +51,30 @@ interface PendingRead {
 
 type RegionsResolver = (regions: MemoryRegion[] | null) => void;
 
+// Generic debugger command channel (see docs/debugger/ARCHITECTURE.md).
+// Request args are packed little-endian; responses are parsed JSON.
+export enum DebugCommandKind {
+  GetRegisters = 0,
+  Disassemble = 1,
+  GetModules = 2,
+  GetThreads = 3,
+  GetCallStack = 4,
+  SetBreakpoint = 5,
+  ClearBreakpoint = 6,
+  ListBreakpoints = 7,
+  StepInto = 8,
+  StepOver = 9,
+  StepOut = 10,
+  RunTo = 11,
+  Continue = 12,
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type DebugCommandResult = { ok: boolean; data: any };
+
 const MEMORY_READ_TIMEOUT_MS = 8000;
 const MEMORY_REGIONS_TIMEOUT_MS = 4000;
+const DEBUG_COMMAND_TIMEOUT_MS = 8000;
 
 function createDefaultEmulationStatus(): EmulationStatus {
   return {
@@ -116,7 +139,13 @@ export class Emulator {
   terminateResolve: (value: number | null) => void;
   terminateReject: (reason?: any) => void;
   worker: Worker;
+  mode: EmulatorMode;
   state: EmulationState = EmulationState.Stopped;
+  // Monotonic counter bumped every time the backend (re-)enters the paused
+  // state. A single step is Running -> Paused; React may coalesce the
+  // intermediate Running away, so a false->true `paused` prop transition is
+  // NOT observable. UI refreshes off this counter instead.
+  pauseCount: number = 0;
   exit_status: number | null = null;
   start_time: Date = new Date();
   pause_time: Date | null = null;
@@ -126,15 +155,27 @@ export class Emulator {
   // The paused backend answers in FIFO order per address.
   private pendingMemoryReads: Map<string, PendingRead[]> = new Map();
   private pendingRegionRequests: RegionsResolver[] = [];
+  private uiMessageHandlers: Set<UiMessageHandler> = new Set();
+
+  // Generic debugger command channel: each request gets a unique id; the
+  // backend echoes it on the response so correlation is exact (no FIFO
+  // ambiguity even across timeouts).
+  private nextDebugCommandId = 1;
+  private pendingDebugCommands: Map<
+    number,
+    { settle: (r: DebugCommandResult | null) => void; settled: boolean }
+  > = new Map();
 
   constructor(
     logHandler: LogHandler,
     stateChangeHandler: StateChangeHandler,
     stautsUpdateHandler: StatusUpdateHandler,
+    mode: EmulatorMode = "windows",
   ) {
     this.logHandler = logHandler;
     this.stateChangeHandler = stateChangeHandler;
     this.stautsUpdateHandler = stautsUpdateHandler;
+    this.mode = mode;
     this.terminateResolve = () => {};
     this.terminateReject = () => {};
     this.terminatePromise = new Promise((resolve, reject) => {
@@ -144,12 +185,15 @@ export class Emulator {
 
     const busterParams = cacheBuster ? `?${cacheBuster}` : "";
 
-    this.worker = new Worker("./emulator-worker.js" + busterParams);
+    const workerScript =
+      mode === "linux" ? "./linux-emulator-worker.js" : "./emulator-worker.js";
+
+    this.worker = new Worker(workerScript + busterParams);
     this.worker.onerror = this._onError.bind(this);
     this.worker.onmessage = (e) => queueMicrotask(() => this._onMessage(e));
   }
 
-  async start(settings: Settings, file: string) {
+  async start(settings: Settings, file: string, breakOnStart = false) {
     this.start_time = new Date();
     this.pause_time = null;
     this.paused_time = 0;
@@ -157,6 +201,9 @@ export class Emulator {
     this.stautsUpdateHandler(createDefaultEmulationStatus());
 
     const options = translateSettings(settings);
+    if (breakOnStart) {
+      options.emulatorOptions.push("--break-start");
+    }
 
     this.worker.postMessage({
       message: "run",
@@ -187,12 +234,18 @@ export class Emulator {
   stop() {
     this.worker.terminate();
     this._flushPendingMemoryRequests();
+    this.uiMessageHandlers.clear();
     this._setState(EmulationState.Stopped);
     this.terminateResolve(null);
   }
 
   onTerminate() {
     return this.terminatePromise;
+  }
+
+  addUiMessageListener(handler: UiMessageHandler) {
+    this.uiMessageHandlers.add(handler);
+    return () => this.uiMessageHandlers.delete(handler);
   }
 
   sendEvent(event: fbDebugger.DebugEventT) {
@@ -451,6 +504,102 @@ export class Emulator {
     return regions;
   }
 
+  /**
+   * Pack debugger-command args into a little-endian byte buffer. Parts:
+   * ["u64", bigint] | ["u32", number] | ["u8", number].
+   */
+  static encodeDebugArgs(
+    parts: (["u64", bigint] | ["u32", number] | ["u8", number])[],
+  ): Uint8Array {
+    let size = 0;
+    for (const [t] of parts) {
+      size += t === "u64" ? 8 : t === "u32" ? 4 : 1;
+    }
+    const buf = new Uint8Array(size);
+    const view = new DataView(buf.buffer);
+    let off = 0;
+    for (const [t, v] of parts) {
+      if (t === "u64") {
+        view.setBigUint64(off, BigInt(v), true);
+        off += 8;
+      } else if (t === "u32") {
+        view.setUint32(off, Number(v) >>> 0, true);
+        off += 4;
+      } else {
+        view.setUint8(off, Number(v) & 0xff);
+        off += 1;
+      }
+    }
+    return buf;
+  }
+
+  /**
+   * Issue a generic debugger command against the paused emulator. Resolves
+   * the parsed JSON result, or `null` if not paused / timed out / unsupported
+   * by the running build.
+   */
+  debugCommand(
+    kind: DebugCommandKind,
+    args: Uint8Array = new Uint8Array(0),
+  ): Promise<DebugCommandResult | null> {
+    if (this.state !== EmulationState.Paused) {
+      return Promise.resolve(null);
+    }
+
+    const id = this.nextDebugCommandId++;
+    if (this.nextDebugCommandId > 0xffffffff) {
+      this.nextDebugCommandId = 1;
+    }
+
+    return new Promise<DebugCommandResult | null>((resolve) => {
+      const entry = {
+        settled: false,
+        settle: (() => {}) as (r: DebugCommandResult | null) => void,
+      };
+      const finish = (value: DebugCommandResult | null) => {
+        if (entry.settled) {
+          return;
+        }
+        entry.settled = true;
+        clearTimeout(timer);
+        this.pendingDebugCommands.delete(id);
+        resolve(value);
+      };
+      entry.settle = finish;
+      const timer = setTimeout(() => finish(null), DEBUG_COMMAND_TIMEOUT_MS);
+
+      this.pendingDebugCommands.set(id, entry);
+
+      this.sendEvent(
+        new fbDebugger.DebugEventT(
+          fbDebugger.Event.DebugCommandRequest,
+          new fbDebugger.DebugCommandRequestT(id, kind, Array.from(args)),
+        ),
+      );
+    });
+  }
+
+  _handle_debug_command_response(response: fbDebugger.DebugCommandResponseT) {
+    const entry = this.pendingDebugCommands.get(response.id);
+    if (!entry || entry.settled) {
+      return;
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let data: any = null;
+    try {
+      if (response.payload.length > 0) {
+        data = JSON.parse(
+          new TextDecoder().decode(Uint8Array.from(response.payload)),
+        );
+      }
+    } catch (e) {
+      console.log(e);
+    }
+
+    entry.settle({ ok: response.ok, data });
+  }
+
   private _flushPendingMemoryRequests() {
     const reads = this.pendingMemoryReads;
     this.pendingMemoryReads = new Map();
@@ -466,6 +615,14 @@ export class Emulator {
     this.pendingRegionRequests = [];
     for (const resolver of regions) {
       resolver(null);
+    }
+
+    const debug = this.pendingDebugCommands;
+    this.pendingDebugCommands = new Map();
+    for (const entry of debug.values()) {
+      if (!entry.settled) {
+        entry.settle(null);
+      }
     }
   }
 
@@ -491,6 +648,13 @@ export class Emulator {
   }
 
   _onMessage(event: MessageEvent) {
+    if (event.data?.type === "sogen_ui") {
+      for (const handler of this.uiMessageHandlers) {
+        handler(event.data);
+      }
+      return;
+    }
+
     if (event.data.message == "log") {
       this.logHandler(event.data.data);
     } else if (event.data.message == "event") {
@@ -529,6 +693,11 @@ export class Emulator {
       case fbDebugger.Event.GetMemoryRegionsResponse:
         this._handle_memory_regions_response(
           event.event as fbDebugger.GetMemoryRegionsResponseT,
+        );
+        break;
+      case fbDebugger.Event.DebugCommandResponse:
+        this._handle_debug_command_response(
+          event.event as fbDebugger.DebugCommandResponseT,
         );
         break;
     }
@@ -580,7 +749,12 @@ export class Emulator {
   }
 
   _setState(state: EmulationState) {
+    const previous = this.state;
     this.state = state;
+
+    if (state === EmulationState.Paused && previous !== EmulationState.Paused) {
+      this.pauseCount++;
+    }
 
     if (isFinalState(this.state) || this.state === EmulationState.Paused) {
       this.pause_time = new Date();

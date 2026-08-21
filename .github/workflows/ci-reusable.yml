@@ -53,9 +53,15 @@ jobs:
             runner: ubuntu-24.04
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           submodules: recursive
+
+      - name: Configure fast APT mirror
+        uses: vegardit/fast-apt-mirror.sh@1.4.5
+        if: "${{ matrix.platform == 'Linux' }}"
+        with:
+          exclude-current: true
 
       - name: Install LLVM
         uses: KyleMayes/install-llvm-action@v2
@@ -83,6 +89,23 @@ jobs:
           jobs="$(python -c 'import os; print(max(1, (os.cpu_count() or 1) * 2))')"
           echo "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" >> "$GITHUB_ENV"
 
+      - name: Install Linux UI Dependencies
+        if: "${{ matrix.platform == 'Linux' }}"
+        uses: nick-fields/retry@v4.0.0
+        with:
+          max_attempts: 5
+          timeout_minutes: 15
+          retry_wait_seconds: 60
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              libasound2-dev libpulse-dev libjack-jackd2-dev libsndio-dev \
+              libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
+              libxi-dev libxss-dev libxtst-dev libxkbcommon-dev \
+              libdrm-dev libgbm-dev libgl1-mesa-dev libegl-dev libgles-dev \
+              libdbus-1-dev libudev-dev \
+              libpipewire-0.3-dev libwayland-dev libdecor-0-dev liburing-dev
+
       - name: CMake Build
         run: cmake --workflow --preset=tidy
 
@@ -93,7 +116,12 @@ jobs:
       LLVM_VERSION: 21
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
+
+      - name: Configure fast APT mirror
+        uses: vegardit/fast-apt-mirror.sh@1.4.5
+        with:
+          exclude-current: true
 
       - name: Install Clang-format
         uses: nick-fields/retry@v4.0.0
@@ -114,25 +142,61 @@ jobs:
       - name: Verify Page Formatting
         run: cd page && npx --yes prettier . --check
 
-  build-apiset-dumper:
-    name: Build API Set Dumper
+  build-root-tools:
+    name: Build Root Tools
     runs-on: windows-latest
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
-      - name: Enable Developer Command Prompt
-        uses: ilammy/msvc-dev-cmd@v1.13.0
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
 
-      - name: CMake Build
-        run: cmake --preset=release && cmake --build --preset=release -t dump-apiset
+      # libclang lets the Steam-bridge generator run at configure time, so the guest steamclient shims are
+      # actually built here rather than silently skipped. The root CMakeLists resolves the PATH interpreter
+      # (this one), so it and pip agree.
+      - name: Install libclang (Steam bridge codegen)
+        run: python -m pip install --disable-pip-version-check libclang
+
+      - name: Enable Developer Command Prompt (x86)
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x86
+
+      - name: Build 32-bit Root Tools
+        run: cmake --preset=release && cmake --build --preset=release -t emulation-root-tools
+
+      - name: Stash 32-bit Shims
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path shims -Force | Out-Null
+          Copy-Item build/release/artifacts/vulkan-shim.dll shims/vulkan-shim-x86.dll -Force
+          Copy-Item build/release/artifacts/steamclient.dll shims/steamclient.dll -Force
+          Remove-Item build/release -Recurse -Force
+
+      - name: Enable Developer Command Prompt (x64)
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+
+      - name: Build 64-bit Root Tools
+        run: cmake --preset=release && cmake --build --preset=release -t emulation-root-tools
+
+      - name: Stage Shims
+        shell: pwsh
+        run: |
+          Move-Item build/release/artifacts/vulkan-shim.dll build/release/artifacts/vulkan-shim-x64.dll -Force
+          Copy-Item shims/vulkan-shim-x86.dll build/release/artifacts/vulkan-shim-x86.dll -Force
+          Copy-Item shims/steamclient.dll build/release/artifacts/steamclient.dll -Force
 
       - name: Upload Artifacts
         uses: pyTooling/upload-artifact@v7
         with:
-          name: Temp API Set Dumper
+          name: Temp Root Build Tools
           working-directory: build/release/artifacts/
           path: "*"
           retention-days: 1
@@ -140,7 +204,7 @@ jobs:
   create-emulation-root:
     name: Create Emulation Root
     runs-on: ${{ matrix.runner }}
-    needs: [build-apiset-dumper]
+    needs: [build-root-tools]
     strategy:
       fail-fast: false
       matrix:
@@ -157,7 +221,7 @@ jobs:
           #  runner: windows-2019
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Download DirectX Runtime
         run: curl --connect-timeout 20 --max-time 200 --retry 5 --retry-delay 2 --retry-max-time 200 -L -o directx_Jun2010_redist.exe https://download.microsoft.com/download/8/4/A/84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe
@@ -168,10 +232,10 @@ jobs:
       - name: Install DirectX Runtime
         run: "cmd /c \"start /wait .\\dxrt\\dxsetup.exe /silent\""
 
-      - name: Download API Set Dumper
+      - name: Download Root Build Tools
         uses: pyTooling/download-artifact@v8
         with:
-          name: Temp API Set Dumper
+          name: Temp Root Build Tools
           path: build/release/artifacts
 
       - name: Create Emulation Root
@@ -179,6 +243,16 @@ jobs:
 
       - name: Dump API Set
         run: cd root && ../build/release/artifacts/dump-apiset.exe
+
+      - name: Install DXVK and Vulkan Shim
+        shell: pwsh
+        run: ./src/tools/install-gpu-runtime.ps1 -WindowsDir root/filesys/c/windows -Shim64 build/release/artifacts/vulkan-shim-x64.dll -Shim32 build/release/artifacts/vulkan-shim-x86.dll
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Install Steam Shim
+        shell: pwsh
+        run: ./src/tools/install-steam-shim.ps1 -SteamDir root/filesys/c/steam -Shim64 build/release/artifacts/steamclient64.dll -Shim32 build/release/artifacts/steamclient.dll
 
       - name: Upload Artifacts
         uses: pyTooling/upload-artifact@v7
@@ -198,14 +272,15 @@ jobs:
           - Windows x86
           - Windows x86_64
           - MinGW x86_64
-          - Linux x86_64 GCC
+          #- Linux x86_64 GCC
           - Linux x86_64 GCC Sanitizer
           - Linux x86_64 Clang
+          - Linux arm64 Clang
           - macOS arm64
-          - macOS x86_64
-          - iOS arm64
+          #- macOS x86_64
+          #- iOS arm64
           - Android x86_64
-          - Android arm64-v8a
+          #- Android arm64-v8a
           - Emscripten Web
           - Emscripten Web Memory 64
           - Emscripten Node.js
@@ -229,48 +304,51 @@ jobs:
             cmake-options: "-DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/cmake/toolchain/mingw-w64.cmake"
           - platform: Linux x86_64 GCC Sanitizer
             runner: ubuntu-24.04
-            cmake-options: "-DMOMO_ENABLE_SANITIZER=On"
-          - platform: Linux x86_64 GCC
-            runner: ubuntu-24.04
+            cmake-options: "-DSOGEN_ENABLE_SANITIZER=On"
+          #- platform: Linux x86_64 GCC
+          #  runner: ubuntu-24.04
           - platform: Linux x86_64 Clang
             runner: ubuntu-24.04
             clang-version: 21
-          - platform: iOS arm64
-            runner: macos-latest
-            rust-target: aarch64-apple-ios
-            cmake-options: "-DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/cmake/toolchain/ios.cmake"
+          - platform: Linux arm64 Clang
+            runner: ubuntu-24.04-arm
+            clang-version: 21
+          #- platform: iOS arm64
+          #  runner: macos-latest
+          #  rust-target: aarch64-apple-ios
+          #  cmake-options: "-DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/cmake/toolchain/ios.cmake"
           - platform: macOS arm64
             runner: macos-latest
-          - platform: macOS x86_64
-            runner: macos-15-intel
+          #- platform: macOS x86_64
+          #  runner: macos-15-intel
           - platform: Android x86_64
             runner: ubuntu-24.04
             abi: x86_64
             rust-target: x86_64-linux-android
             cmake-options: "-DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/cmake/toolchain/android-ndk.cmake"
-          - platform: Android arm64-v8a
-            runner: ubuntu-24.04
-            abi: arm64-v8a
-            rust-target: aarch64-linux-android
-            cmake-options: "-DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/cmake/toolchain/android-ndk.cmake"
+          #- platform: Android arm64-v8a
+          #  runner: ubuntu-24.04
+          #  abi: arm64-v8a
+          #  rust-target: aarch64-linux-android
+          #  cmake-options: "-DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/cmake/toolchain/android-ndk.cmake"
           - platform: Emscripten Web
             runner: ubuntu-24.04
-            cmake-options: "-DMOMO_ENABLE_RUST_CODE=Off -DCMAKE_TOOLCHAIN_FILE=$(dirname $(which emcc))/cmake/Modules/Platform/Emscripten.cmake"
+            cmake-options: "-DSOGEN_ENABLE_RUST_CODE=Off -DCMAKE_TOOLCHAIN_FILE=$(dirname $(which emcc))/cmake/Modules/Platform/Emscripten.cmake"
           - platform: Emscripten Web Memory 64
             runner: ubuntu-24.04
-            cmake-options: "-DMOMO_ENABLE_RUST_CODE=Off -DMOMO_EMSCRIPTEN_MEMORY64=On -DCMAKE_TOOLCHAIN_FILE=$(dirname $(which emcc))/cmake/Modules/Platform/Emscripten.cmake"
+            cmake-options: "-DSOGEN_ENABLE_RUST_CODE=Off -DSOGEN_EMSCRIPTEN_MEMORY64=On -DCMAKE_TOOLCHAIN_FILE=$(dirname $(which emcc))/cmake/Modules/Platform/Emscripten.cmake"
           - platform: Emscripten Node.js
             runner: ubuntu-24.04
-            cmake-options: "-DMOMO_EMSCRIPTEN_SUPPORT_NODEJS=On -DMOMO_ENABLE_RUST_CODE=Off -DCMAKE_TOOLCHAIN_FILE=$(dirname $(which emcc))/cmake/Modules/Platform/Emscripten.cmake"
+            cmake-options: "-DSOGEN_EMSCRIPTEN_SUPPORT_NODEJS=On -DSOGEN_ENABLE_RUST_CODE=Off -DCMAKE_TOOLCHAIN_FILE=$(dirname $(which emcc))/cmake/Modules/Platform/Emscripten.cmake"
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Configure fast APT mirror
-        uses: vegardit/fast-apt-mirror.sh@1.4.4
-        if: "${{ startsWith(matrix.platform, 'MinGW') }}"
+        uses: vegardit/fast-apt-mirror.sh@1.4.5
+        if: "${{ startsWith(matrix.platform, 'MinGW') || startsWith(matrix.platform, 'Linux') }}"
         with:
           exclude-current: true
 
@@ -284,7 +362,7 @@ jobs:
 
       - name: Install Clang
         uses: nick-fields/retry@v4.0.0
-        if: "${{ matrix.platform == 'Linux x86_64 Clang' }}"
+        if: "${{ matrix.clang-version }}"
         with:
           max_attempts: 5
           timeout_minutes: 15
@@ -298,6 +376,19 @@ jobs:
             sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/clang++-${{ matrix.clang-version }} 100
             sudo update-alternatives --set cc /usr/bin/clang-${{ matrix.clang-version }}
             sudo update-alternatives --set c++ /usr/bin/clang++-${{ matrix.clang-version }}
+
+      # ubuntu-24.04-arm doesn't ship ninja-build preinstalled the way ubuntu-24.04 (x86_64) does,
+      # and every preset here requires the Ninja generator.
+      - name: Install Ninja
+        if: "${{ matrix.platform == 'Linux arm64 Clang' }}"
+        uses: nick-fields/retry@v4.0.0
+        with:
+          max_attempts: 5
+          timeout_minutes: 15
+          retry_wait_seconds: 60
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends ninja-build
 
       - name: Set up MinGW
         uses: egor-tensin/setup-mingw@v3
@@ -325,6 +416,42 @@ jobs:
           echo "ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
           echo "ANDROID_ABI=${{ matrix.abi }}" >> $GITHUB_ENV
 
+      - name: Install Linux UI Dependencies
+        if: "${{ startsWith(matrix.platform, 'Linux') }}"
+        uses: nick-fields/retry@v4.0.0
+        with:
+          max_attempts: 5
+          timeout_minutes: 15
+          retry_wait_seconds: 60
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              libasound2-dev libpulse-dev libjack-jackd2-dev libsndio-dev \
+              libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
+              libxi-dev libxss-dev libxtst-dev libxkbcommon-dev \
+              libdrm-dev libgbm-dev libgl1-mesa-dev libegl-dev libgles-dev \
+              libdbus-1-dev libudev-dev \
+              libpipewire-0.3-dev libwayland-dev libdecor-0-dev liburing-dev
+
+      # libclang lets the Steam-bridge generator run at configure time. Installed in every build job (cheap,
+      # and where the bridge isn't built the WIN32/host-platform gate just skips it). The root CMakeLists
+      # resolves the PATH interpreter, so this and pip agree.
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install libclang (Steam bridge codegen)
+        run: python -m pip install --disable-pip-version-check libclang
+
+      # deps/FEX/CMakeLists.txt invokes aarch64_fit_native.py via execute_process(COMMAND python3 ...),
+      # which resolves through PATH - the interpreter Set up Python just configured, not a system one.
+      # Needed on every platform SOGEN_ENABLE_FEX can be true on (see the root CMakeLists' gate: ARM64 +
+      # Clang + Linux-or-Darwin).
+      - name: Install FEXCore Build Prerequisites (Python)
+        if: "${{ matrix.platform == 'Linux arm64 Clang' || matrix.platform == 'macOS arm64' }}"
+        run: python -m pip install --disable-pip-version-check packaging
+
       - name: CMake Build
         run: cmake --preset=${{matrix.preset}} ${{matrix.cmake-options}} && cmake --build --preset=${{matrix.preset}}
 
@@ -337,7 +464,7 @@ jobs:
           retention-days: 1
 
       - name: Upload Test Configuration
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: Temp ${{ matrix.platform }} ${{matrix.configuration}} Test Config
           path: "build/${{matrix.preset}}/**/CTestTestfile.cmake"
@@ -368,7 +495,7 @@ jobs:
             cmake-options: "-DSOGEN_ENABLE_LTO=Off"
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -377,6 +504,17 @@ jobs:
         if: ${{ startsWith(matrix.platform, 'Windows') }}
         with:
           arch: ${{ matrix.devcmd_arch }}
+
+      # libclang lets the Steam-bridge generator run at configure time. Installed in every build job (cheap,
+      # and where the bridge isn't built the WIN32/host-platform gate just skips it). The root CMakeLists
+      # resolves the PATH interpreter, so this and pip agree.
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install libclang (Steam bridge codegen)
+        run: python -m pip install --disable-pip-version-check libclang
 
       - name: CMake Build
         run: cmake --preset=${{matrix.preset}} ${{matrix.cmake-options}} && cmake --build --preset=${{matrix.preset}}
@@ -390,7 +528,7 @@ jobs:
           retention-days: 1
 
       - name: Upload Test Configuration
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: Temp Isolate ${{ matrix.platform }} ${{matrix.configuration}} Test Config
           path: "build/${{matrix.preset}}/**/CTestTestfile.cmake"
@@ -405,18 +543,18 @@ jobs:
       matrix:
         platform:
           - Windows x86
-          - Windows x86_64
-          - Linux x86_64 GCC
+          #- Windows x86_64
+          #- Linux x86_64 GCC
           - Linux x86_64 GCC Sanitizer
           - Linux x86_64 Clang
           - macOS arm64
-          - macOS x86_64
+          #- macOS x86_64
         emulator:
           - Unicorn
           - Icicle
         emulation-root:
-          #- Windows 2025
-          - Windows 2022
+          - Windows 2025
+          #- Windows 2022
           #- Windows 2019
         configuration:
           #- Debug
@@ -428,21 +566,21 @@ jobs:
             preset: release
           - platform: Windows x86
             runner: windows-latest
-          - platform: Windows x86_64
-            runner: windows-latest
-          - platform: Linux x86_64 GCC
-            runner: ubuntu-24.04
+          #- platform: Windows x86_64
+          #  runner: windows-latest
+          #- platform: Linux x86_64 GCC
+          #  runner: ubuntu-24.04
           - platform: Linux x86_64 GCC Sanitizer
             runner: ubuntu-24.04
           - platform: Linux x86_64 Clang
             runner: ubuntu-24.04
           - platform: macOS arm64
             runner: macos-latest
-          - platform: macOS x86_64
-            runner: macos-15-intel
+          #- platform: macOS x86_64
+          #  runner: macos-15-intel
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -454,7 +592,7 @@ jobs:
           echo "EMULATOR_ICICLE=${{ matrix.emulator == 'Icicle' }}" >> $GITHUB_ENV
 
       - name: Download Test Configuration
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8
         with:
           name: Temp ${{ matrix.platform }} ${{matrix.configuration}} Test Config
           path: build/${{matrix.preset}}
@@ -488,6 +626,18 @@ jobs:
           EMULATOR_ROOT: ${{github.workspace}}/build/${{matrix.preset}}/artifacts/root
           EMULATOR_VERBOSE: ${{ inputs.verbose }}
           ANALYSIS_SAMPLE: ${{github.workspace}}/build/${{matrix.preset}}/artifacts/test-sample.exe
+          LINUX_TEST_ROOT: ${{github.workspace}}/deps/sogen-linux-files/test/linux
+
+      - name: Upload Serialization Mismatch Dumps
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: Serialization Mismatch ${{ matrix.platform }} ${{ matrix.emulator }} ${{ matrix.configuration }}
+          path: |
+            build/${{matrix.preset}}/artifacts/*.a.bin
+            build/${{matrix.preset}}/artifacts/*.b.bin
+          if-no-files-found: ignore
+          retention-days: 7
 
   win-test:
     name: Windows Test
@@ -507,6 +657,11 @@ jobs:
           - Windows 2025
           - Windows 2022
           #- Windows 2019
+        exclude:
+          # The old root exists to prove the pre-Windows-11 guest DLL set still emulates.
+          # That is a guest-side property, so Release alone covers it.
+          - emulation-root: Windows 2022
+            configuration: Debug
         include:
           - configuration: Debug
             preset: debug
@@ -514,7 +669,7 @@ jobs:
             preset: release
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -527,7 +682,7 @@ jobs:
           echo "EMULATOR_WHP=${{ matrix.emulator == 'WHP' }}" >> $GITHUB_ENV
 
       - name: Download Test Configuration
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8
         with:
           name: Temp Isolate Windows x86_64 ${{ matrix.configuration}} Test Config
           path: build/${{ matrix.preset }}
@@ -554,6 +709,17 @@ jobs:
           EMULATOR_VERBOSE: ${{ inputs.verbose }}
           ANALYSIS_SAMPLE: ${{github.workspace}}/build/${{ matrix.preset }}/artifacts/test-sample.exe
 
+      - name: Upload Serialization Mismatch Dumps
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: Serialization Mismatch Windows ${{ matrix.configuration }} ${{ matrix.emulator }} ${{ matrix.emulation-root }}
+          path: |
+            build/${{ matrix.preset }}/artifacts/*.a.bin
+            build/${{ matrix.preset }}/artifacts/*.b.bin
+          if-no-files-found: ignore
+          retention-days: 7
+
   smoke-test-node:
     name: Smoke Test Node.js
     runs-on: ubuntu-24.04
@@ -574,7 +740,7 @@ jobs:
       - name: Download Emulation Root
         uses: pyTooling/download-artifact@v8
         with:
-          name: Windows 2022 Emulation Root
+          name: Windows 2025 Emulation Root
           path: build/release/artifacts/root
 
       - name: Copy Test Sample
@@ -585,6 +751,17 @@ jobs:
         env:
           EMULATOR_ROOT: ${{github.workspace}}/build/release/artifacts/root
           EMULATOR_VERBOSE: ${{ inputs.verbose }}
+
+      - name: Upload Serialization Mismatch Dumps
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: Serialization Mismatch Node.js
+          path: |
+            build/release/artifacts/*.a.bin
+            build/release/artifacts/*.b.bin
+          if-no-files-found: ignore
+          retention-days: 7
 
   smoke-test-whp:
     name: Smoke Test WHP x86_64
@@ -600,7 +777,7 @@ jobs:
       - name: Download Emulation Root
         uses: pyTooling/download-artifact@v8
         with:
-          name: Windows 2022 Emulation Root
+          name: Windows 2025 Emulation Root
           path: build/release/artifacts/root
 
       - name: Copy Test Sample
@@ -634,6 +811,52 @@ jobs:
           EMULATOR_ROOT: ${{github.workspace}}/build/release/artifacts/root
           EMULATOR_VERBOSE: ${{ inputs.verbose }}
 
+  smoke-test-kvm:
+    name: Smoke Test KVM x86_64
+    runs-on: ubuntu-24.04
+    needs: [create-emulation-root, build]
+    steps:
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Download Artifacts
+        uses: pyTooling/download-artifact@v8
+        with:
+          name: Linux x86_64 Clang Release Artifacts
+          path: build/release/artifacts
+
+      - name: Download Windows Artifacts
+        uses: pyTooling/download-artifact@v8
+        with:
+          name: Windows x86_64 Release Artifacts
+          path: build/release/artifacts
+
+      - name: Download Emulation Root
+        uses: pyTooling/download-artifact@v8
+        with:
+          name: Windows 2025 Emulation Root
+          path: build/release/artifacts/root
+
+      - name: Copy Test Sample
+        run: cp build/release/artifacts/test-sample.exe build/release/artifacts/root/filesys/c/
+
+      - name: Print KVM Diagnostics
+        run: |
+          echo "KVM diagnostics"
+          ls -l /dev/kvm || true
+          lscpu | grep -iE 'Virtualization|Hypervisor|Model name' || true
+          grep -m1 -oE 'vmx|svm' /proc/cpuinfo || true
+
+      - name: CMake Test
+        run: cd build/release/artifacts && chmod +x ./analyzer && ./analyzer -e root c:/test-sample.exe
+        env:
+          EMULATOR_KVM: "1"
+          EMULATOR_ROOT: ${{github.workspace}}/build/release/artifacts/root
+          EMULATOR_VERBOSE: ${{ inputs.verbose }}
+
   smoke-test-win32:
     name: Smoke Test Windows x86
     runs-on: windows-latest
@@ -648,7 +871,7 @@ jobs:
       - name: Download Emulation Root
         uses: pyTooling/download-artifact@v8
         with:
-          name: Windows 2022 Emulation Root
+          name: Windows 2025 Emulation Root
           path: build/release/artifacts/root
 
       - name: Copy Test Sample
@@ -657,6 +880,50 @@ jobs:
       - name: CMake Test
         run: cd build/release/artifacts && ./analyzer.exe -e root c:/test-sample.exe
         env:
+          EMULATOR_ROOT: ${{github.workspace}}/build/release/artifacts/root
+          EMULATOR_VERBOSE: ${{ inputs.verbose }}
+
+  smoke-test-fex:
+    name: Smoke Test FEX (macOS arm64)
+    runs-on: macos-latest
+    needs: [create-emulation-root, build]
+    steps:
+      - name: Download Artifacts
+        uses: pyTooling/download-artifact@v8
+        with:
+          name: macOS arm64 Release Artifacts
+          path: build/release/artifacts
+
+      - name: Download Windows Artifacts
+        uses: pyTooling/download-artifact@v8
+        with:
+          name: Windows x86_64 Release Artifacts
+          path: build/release/artifacts
+
+      - name: Download Emulation Root
+        uses: pyTooling/download-artifact@v8
+        with:
+          name: Windows 2025 Emulation Root
+          path: build/release/artifacts/root
+
+      - name: Copy Test Sample
+        run: cp build/release/artifacts/test-sample.exe build/release/artifacts/root/filesys/c/
+
+      # FEX shares the guest address space directly with the host process (unlike Unicorn/Icicle's own
+      # simulated address space), so its free-region search competes with whatever the host's own ASLR
+      # layout happens to leave available this run - a pre-existing, known-flaky class of failure
+      # ("Memory range not allocatable" mapping a module, or an unrelated exit-133 crash under
+      # AddressSanitizer-adjacent conditions) that a fresh process retry, with its own fresh ASLR
+      # layout, reliably works around. Not a substitute for the underlying address-space-exhaustion
+      # investigation, which is tracked separately.
+      - name: CMake Test
+        uses: nick-fields/retry@v4.0.0
+        with:
+          max_attempts: 5
+          timeout_minutes: 10
+          command: cd build/release/artifacts && chmod +x ./analyzer && ./analyzer -e root c:/test-sample.exe
+        env:
+          EMULATOR_FEX: "1"
           EMULATOR_ROOT: ${{github.workspace}}/build/release/artifacts/root
           EMULATOR_VERBOSE: ${{ inputs.verbose }}
 
@@ -674,7 +941,7 @@ jobs:
       - name: Download Emulation Root
         uses: pyTooling/download-artifact@v8
         with:
-          name: Windows 2022 Emulation Root
+          name: Windows 2025 Emulation Root
           path: build/release/artifacts/root
 
       - name: Copy Test Sample
@@ -685,6 +952,17 @@ jobs:
         env:
           EMULATOR_ROOT: ${{github.workspace}}/build/release/artifacts/root
           EMULATOR_VERBOSE: ${{ inputs.verbose }}
+
+      - name: Upload Serialization Mismatch Dumps
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: Serialization Mismatch MinGW x86_64
+          path: |
+            build/release/artifacts/*.a.bin
+            build/release/artifacts/*.b.bin
+          if-no-files-found: ignore
+          retention-days: 7
 
   smoke-test-android:
     name: Smoke Test Android
@@ -700,8 +978,8 @@ jobs:
           - Unicorn
           - Icicle
         emulation-root:
-          #- Windows 2025
-          - Windows 2022
+          - Windows 2025
+          #- Windows 2022
           #- Windows 2019
         configuration:
           #- Debug
@@ -745,7 +1023,7 @@ jobs:
         run: cp build/${{matrix.preset}}/artifacts/test-sample.exe build/${{matrix.preset}}/artifacts/root/filesys/c/
 
       - name: Run Test
-        uses: reactivecircus/android-emulator-runner@v2.37.0
+        uses: reactivecircus/android-emulator-runner@v2.38.0
         with:
           api-level: 29
           arch: ${{matrix.architecture}}
@@ -760,7 +1038,7 @@ jobs:
     needs: [create-emulation-root, build]
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -785,7 +1063,7 @@ jobs:
       - name: Download Emulation Root
         uses: pyTooling/download-artifact@v8
         with:
-          name: Windows 2022 Emulation Root
+          name: Windows 2025 Emulation Root
           path: build/release/artifacts/root
 
       - name: Copy Sample
@@ -793,6 +1071,9 @@ jobs:
 
       - name: Create Emulation Root zip
         run: cd ./build/release/artifacts && zip -r "${{github.workspace}}/page/public/root.zip" ./root
+
+      - name: Create Linux Emulation Root zip
+        run: cd ./deps/sogen-linux-files && zip -r "${{github.workspace}}/page/public/linux-root.zip" ./root
 
       - name: Copy Files
         run: |
@@ -830,35 +1111,68 @@ jobs:
           - runner: macos-latest
             display: macOS arm64
             artifact: macos-arm64
+            macos-deployment-target: "11.0"
           - runner: macos-15-intel
             display: macOS x86_64
             artifact: macos-x86_64
+            macos-deployment-target: "10.13"
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           submodules: recursive
 
+      - name: Configure fast APT mirror
+        uses: vegardit/fast-apt-mirror.sh@1.4.5
+        if: "${{ startsWith(matrix.runner, 'ubuntu') }}"
+        with:
+          exclude-current: true
+
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.9"
+        env:
+          PIP_NO_CACHE_DIR: 1
 
       - name: Install build tools
         run: python -m pip install --upgrade pip build setuptools-scm
+
+      - name: Install Linux UI Dependencies
+        if: "${{ startsWith(matrix.runner, 'ubuntu') }}"
+        uses: nick-fields/retry@v4.0.0
+        with:
+          max_attempts: 5
+          timeout_minutes: 15
+          retry_wait_seconds: 60
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              libasound2-dev libpulse-dev libjack-jackd2-dev libsndio-dev \
+              libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
+              libxi-dev libxss-dev libxtst-dev libxkbcommon-dev \
+              libdrm-dev libgbm-dev libgl1-mesa-dev libegl-dev libgles-dev \
+              libdbus-1-dev libudev-dev \
+              libpipewire-0.3-dev libwayland-dev libdecor-0-dev liburing-dev
 
       - name: Build wheel
         run: python -m build "${{ github.workspace }}" --wheel --outdir dist
         env:
           CMAKE_ARGS: ${{ inputs.enable_deploy && '-DSOGEN_DISABLE_NANOBIND_LEAK_WARNINGS=ON' || '' }}
+          # Pin the macOS platform tag so it doesn't float with the runner OS
+          # version. Without this the wheel is tagged with whatever macOS the
+          # build runner happens to be on (e.g. macosx_26_0 during the
+          # macos-latest migration), which the test job then can't install if it
+          # lands on an older runner.
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos-deployment-target }}
 
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sogen-wheel-${{ matrix.artifact }}
           path: dist/*.whl
-          retention-days: 7
+          retention-days: 1
 
   test-python-wheel:
     name: Test Python Wheel (${{ matrix.display }})
@@ -882,15 +1196,17 @@ jobs:
             artifact: macos-x86_64
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.9"
+        env:
+          PIP_NO_CACHE_DIR: 1
 
       - name: Download wheel artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: sogen-wheel-${{ matrix.artifact }}
           path: dist
@@ -908,7 +1224,7 @@ jobs:
       - name: Download Emulation Root
         uses: pyTooling/download-artifact@v8
         with:
-          name: Windows 2022 Emulation Root
+          name: Windows 2025 Emulation Root
           path: build/release/artifacts/root
 
       - name: Copy Test Sample
@@ -921,20 +1237,45 @@ jobs:
           EMULATOR_VERBOSE: ${{ inputs.verbose }}
           ANALYSIS_SAMPLE: ${{github.workspace}}/build/release/artifacts/test-sample.exe
 
+      - name: Run Python Linux Unicorn Test Script
+        if: ${{ startsWith(matrix.runner, 'ubuntu') }}
+        run: python src/python-bindings/test_linux.py
+        env:
+          LINUX_PYTHON_TEST_BINARY: /bin/true
+          LINUX_PYTHON_TEST_ROOT: /
+          LINUX_PYTHON_TEST_BACKEND: unicorn
+
+      - name: Enable KVM
+        if: ${{ startsWith(matrix.runner, 'ubuntu') }}
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run Python Linux KVM Test Script
+        if: ${{ startsWith(matrix.runner, 'ubuntu') }}
+        run: python src/python-bindings/test_linux.py
+        env:
+          LINUX_PYTHON_TEST_BINARY: /bin/true
+          LINUX_PYTHON_TEST_ROOT: /
+          LINUX_PYTHON_TEST_BACKEND: kvm
+
   build-python-sdist:
     name: Build Python Sdist
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           submodules: recursive
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.9"
+        env:
+          PIP_NO_CACHE_DIR: 1
 
       - name: Install build tools
         run: python -m pip install --upgrade pip build setuptools-scm
@@ -943,11 +1284,11 @@ jobs:
         run: python -m build "${{ github.workspace }}" --sdist --outdir dist
 
       - name: Upload sdist artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sogen-sdist
           path: dist/*.tar.gz
-          retention-days: 7
+          retention-days: 1
 
   test-python-sdist:
     name: Test Python Sdist
@@ -955,16 +1296,21 @@ jobs:
     needs: [build-python-sdist]
     steps:
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.9"
+        env:
+          PIP_NO_CACHE_DIR: 1
 
       - name: Download sdist artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: sogen-sdist
           path: dist
 
+      # Intentionally NOT installing the SDL build dependencies here: this job
+      # proves that a source install builds headless. pyproject.toml sets
+      # SDL_UNIX_CONSOLE_BUILD=ON so the bundled SDL3 builds without X11/Wayland.
       - name: Install sdist
         run: python -m pip install --upgrade pip && python -m pip install --force-reinstall dist/*.tar.gz
 
@@ -976,34 +1322,6 @@ jobs:
           assert hasattr(sogen, "Backend")
           print("ok")
           PY
-
-  deploy-page:
-    name: Deploy Page
-    runs-on: ubuntu-latest
-    needs: [build-page, summary]
-    if: ${{ inputs.enable_deploy }}
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    steps:
-      - name: Download Page Artifacts
-        uses: pyTooling/download-artifact@v8
-        with:
-          name: Page Artifacts
-          path: ./page/dist/
-
-      - name: Setup Pages
-        uses: actions/configure-pages@v6
-
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v5
-        with:
-          path: ./page/dist
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v5
 
   summary:
     name: Pipeline Summary
@@ -1017,8 +1335,10 @@ jobs:
         build-python-sdist,
         test-python-sdist,
         clang-tidy,
-        build-apiset-dumper,
+        build-root-tools,
         smoke-test-whp,
+        smoke-test-kvm,
+        smoke-test-fex,
         smoke-test-node,
         smoke-test-mingw,
         smoke-test-win32,

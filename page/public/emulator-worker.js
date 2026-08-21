@@ -2,9 +2,77 @@ var logLines = [];
 var lastFlush = new Date().getTime();
 
 var msgQueue = [];
+var pendingUiEvents = [];
+const runtimeRoot = "/root-windows";
+
+function ensureDirectory(path) {
+  if (!FS.analyzePath(path).exists) {
+    FS.mkdirTree(path, 0o777);
+  }
+}
+
+function getUiEventBridge() {
+  if (typeof globalThis.sogen_web_ui_push_event === "function") {
+    return globalThis.sogen_web_ui_push_event;
+  }
+
+  if (typeof globalThis._sogen_web_ui_push_event === "function") {
+    return globalThis._sogen_web_ui_push_event;
+  }
+
+  if (typeof globalThis.Module?._sogen_web_ui_push_event === "function") {
+    return globalThis.Module._sogen_web_ui_push_event.bind(globalThis.Module);
+  }
+
+  return null;
+}
+
+function dispatchUiEvent(data, fromMessage = false) {
+  if (
+    fromMessage &&
+    globalThis.__sogenUiBridgeInitialized &&
+    globalThis.__sogenUiBridgeAvailable
+  ) {
+    return true;
+  }
+
+  const bridge = getUiEventBridge();
+  if (!bridge) {
+    pendingUiEvents.push(data);
+    return false;
+  }
+
+  bridge(
+    data.window >>> 0,
+    data.message >>> 0,
+    data.wParam >>> 0,
+    data.lParam >>> 0,
+  );
+  return true;
+}
+
+function flushUiEvents() {
+  if (pendingUiEvents.length === 0) {
+    return;
+  }
+
+  const events = pendingUiEvents;
+  pendingUiEvents = [];
+  for (const event of events) {
+    if (!dispatchUiEvent(event)) {
+      break;
+    }
+  }
+}
 
 onmessage = async (event) => {
   const data = event.data;
+
+  if (data?.type === "sogen_ui_event") {
+    dispatchUiEvent(data, true);
+    return;
+  }
+
   const payload = data.data;
 
   switch (data.message) {
@@ -80,7 +148,13 @@ function runEmulation(
   wasm64,
   cacheBuster,
 ) {
-  const mainArguments = [...options, "-e", "./root", file, ...appArguments];
+  const mainArguments = [
+    ...options,
+    "-e",
+    "." + runtimeRoot,
+    file,
+    ...appArguments,
+  ];
 
   globalThis.Module = {
     arguments: mainArguments,
@@ -91,10 +165,12 @@ function runEmulation(
       return `${scriptDirectory}${bitness}/${path}${busterParams}`;
     },
     onRuntimeInitialized: function () {
-      FS.mkdir("/root");
-      FS.mount(IDBFS, {}, "/root");
+      flushUiEvents();
+      ensureDirectory(runtimeRoot);
+      FS.mount(IDBFS, {}, runtimeRoot);
       FS.syncfs(true, function (_) {
         setTimeout(() => {
+          flushUiEvents();
           Module.callMain(mainArguments);
         }, 0);
       });

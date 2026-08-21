@@ -1,46 +1,17 @@
-file(GLOB_RECURSE SRC_FILES CONFIGURE_DEPENDS
-  *.cpp
-  *.hpp
-  *.rc
-)
+add_executable(analyzer main.cpp)
 
-list(SORT SRC_FILES)
-
-add_executable(analyzer ${SRC_FILES})
-
-momo_assign_source_group(${SRC_FILES})
-
-if(NOT MOMO_ENABLE_CLANG_TIDY)
-  target_precompile_headers(analyzer PRIVATE std_include.hpp)
+if(WIN)
+  target_sources(analyzer PRIVATE resource.rc)
 endif()
 
-target_link_libraries(analyzer PRIVATE
-  debugger
-  disassembler
-  capstone
-  windows-emulator
-  windows-gdb-stub
-  backend-selection
-)
+sogen_assign_source_group(main.cpp)
 
-if(MOMO_ENABLE_REFLECTION)
-  target_link_libraries(analyzer PRIVATE
-    reflect
-  )
-endif()
+target_link_libraries(analyzer PRIVATE windows-analyzer linux-analyzer)
 
 set_property(GLOBAL PROPERTY VS_STARTUP_PROJECT analyzer)
 
-momo_strip_target(analyzer)
-
-set(ENV_PREFIX "$")
-set(ENV_SUFFIX "")
-
-if(WIN)
-  set(ENV_PREFIX "%")
-  set(ENV_SUFFIX "%")
-endif()
+sogen_strip_target(analyzer)
 
 add_test(NAME analyzer-test
-         COMMAND "${PYTHON3_EXE}" "${CMAKE_CURRENT_LIST_DIR}/test.py"
+         COMMAND "${PYTHON3_EXE}" "${CMAKE_CURRENT_LIST_DIR}/../windows-analyzer/test.py"
          WORKING_DIRECTORY "$<TARGET_FILE_DIR:analyzer>")

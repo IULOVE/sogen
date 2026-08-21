@@ -26,8 +26,10 @@
 
 #define ASSERT_TERMINATED_SUCCESSFULLY(win_emu) ASSERT_TERMINATED_WITH_STATUS(win_emu, STATUS_SUCCESS)
 
-namespace test
+namespace sogen::test
 {
+    using namespace std::literals;
+
     inline bool enable_verbose_logging()
     {
         const auto* env = getenv("EMULATOR_VERBOSE");
@@ -131,8 +133,17 @@ namespace test
             interfaces.socket_factory = network::create_static_socket_factory();
         }
 
+        if (!interfaces.ui)
+        {
+            // A real UI backend (SDL) shows an actual host window and pumps host-originated events (mouse
+            // motion, focus, ...) on a wall-clock-dependent schedule. Under a deterministic clock that races
+            // with guest completion and makes cursor/focus state non-reproducible between runs. Tests don't
+            // need a real window, so use the no-op backend unless one is explicitly injected.
+            interfaces.ui = std::make_unique<null_ui_backend>();
+        }
+
         return windows_emulator{
-            create_x86_64_emulator(),
+            create_x86_64_emulator_from_environment(),
             settings,
             std::move(callbacks),
             std::move(interfaces),
@@ -166,8 +177,19 @@ namespace test
             interfaces.dns_lookup = create_sample_dns_lookup();
         }
 
+        if (!interfaces.ui)
+        {
+            // See create_emulator() above: tests don't need a real (SDL) window, and a real UI backend's
+            // host-originated events would otherwise race with deterministic guest execution.
+            interfaces.ui = std::make_unique<null_ui_backend>();
+        }
+
         return windows_emulator{
-            create_x86_64_emulator(), get_sample_app_settings(config), settings, std::move(callbacks), std::move(interfaces),
+            create_x86_64_emulator_from_environment(),
+            get_sample_app_settings(config),
+            settings,
+            std::move(callbacks),
+            std::move(interfaces),
         };
     }
 
@@ -257,4 +279,4 @@ namespace test
 
         printf("Diff detected after 0x%" PRIx64 " instructions at 0x%" PRIx64 " (%s)\n", lower_bound, rip, emu.mod_manager.find_name(rip));
     }
-}
+} // namespace sogen::test

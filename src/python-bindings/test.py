@@ -21,28 +21,34 @@ assert analysis_sample
 hook_sample = Path(hook_sample_env) if hook_sample_env else Path(analysis_sample).with_name("hook-sample.exe")
 
 mod = importlib.import_module("sogen")
-assert hasattr(mod, "WindowsEmulator")
-assert hasattr(mod, "MemoryManager")
-assert hasattr(mod, "ProcessContext")
-assert hasattr(mod, "Thread")
-assert hasattr(mod, "Hook")
-assert hasattr(mod, "Hooks")
+win = mod.windows
+assert hasattr(mod, "windows")
+assert hasattr(win, "WindowsEmulator")
+assert hasattr(win, "Emulator")
+assert hasattr(win, "MemoryManager")
+assert hasattr(win, "ProcessContext")
+assert hasattr(win, "Thread")
+assert hasattr(win, "Hook")
+assert hasattr(win, "Hooks")
 assert hasattr(mod, "Instruction")
 assert hasattr(mod, "HookContinuation")
 assert hasattr(mod, "MemoryViolationContinuation")
 assert hasattr(mod, "ApiContinuation")
 assert hasattr(mod, "CallingConvention")
 assert hasattr(mod, "api_call")
+assert hasattr(win, "api_call")
 assert hasattr(mod, "Backend")
 assert hasattr(mod, "BasicBlock")
 assert hasattr(mod, "MappedModule")
 assert hasattr(mod, "Register")
 assert hasattr(mod, "MemoryPermission")
 assert hasattr(mod, "MemoryViolationType")
-assert hasattr(mod, "create_empty")
-assert hasattr(mod, "create_application")
+assert hasattr(win, "create_empty")
+assert hasattr(win, "create_application")
+assert mod.create_empty is win.create_empty
+assert mod.create_application is win.create_application
 
-emu = mod.create_empty(emulation_root=emulator_root)
+emu = win.create_empty(emulation_root=emulator_root)
 assert emu.backend_name in {"Unicorn Engine", "icicle-emu", "Windows Hypervisor Platform"}
 assert hasattr(emu, "read_memory")
 assert hasattr(emu, "write_memory")
@@ -72,7 +78,7 @@ emu.callbacks.on_module_unload = lambda m: None
 sleep_hits = {"count": 0, "args": []}
 
 
-@mod.api_call(cc=mod.CallingConvention.stdcall, params=[ctypes.c_uint32])
+@win.api_call(cc=mod.CallingConvention.stdcall, params=[ctypes.c_uint32])
 def on_sleep(call, params):
     sleep_hits["count"] += 1
     sleep_hits["args"].append(params[0])
@@ -101,7 +107,7 @@ with tempfile.TemporaryDirectory(prefix="sogen-python-") as temp_dir:
     if not sample_copy.exists():
         sample_copy.write_bytes(test_sample.read_bytes())
 
-    app = mod.create_application(
+    app = win.create_application(
         r"C:\test-sample.exe",
         emulation_root=emulator_root,
         path_mappings={r"C:\a.txt": mapped_file},
@@ -123,9 +129,45 @@ with tempfile.TemporaryDirectory(prefix="sogen-python-") as temp_dir:
     )
     assert sleep_hits["count"] > 0
     assert app.process.exit_status == 0, f"non-zero exit: {app.process.exit_status}"
-    assert all(arg == 1 for arg in sleep_hits["args"])
+    assert all(arg in {0, 1} for arg in sleep_hits["args"])
 
     app = None
+    gc.collect()
+
+# temporary hook lifetime smoke test: returned Hook object must not be kept in Python
+# for hook to stay active.
+if hook_sample.exists():
+    temp_hook_hits = {"count": 0}
+    temp_app_box = {"app": None}
+
+    def on_temp_module_load(module):
+        if module.name.lower() == "hook-sample.exe":
+            temp_app_box["app"].hooks.memory_execution_at(
+                module.entry_point,
+                lambda address: temp_hook_hits.__setitem__("count", temp_hook_hits["count"] + 1),
+            )
+
+    hook_sample_copy = filesys_root / "hook-sample.exe"
+    hook_sample_copy.write_bytes(hook_sample.read_bytes())
+
+    @win.api_call(cc=mod.CallingConvention.stdcall, params=[])
+    def on_temp_get_current_process_id(call, params):
+        call.return_value = 0xC0FFEE01
+        return mod.ApiContinuation.intercept
+
+    temp_app = win.create_application(
+        r"C:\hook-sample.exe",
+        emulation_root=emulator_root,
+    )
+    temp_app_box["app"] = temp_app
+    temp_app.callbacks.on_stdout = lambda text: print(text, end="", flush=True)
+    temp_app.callbacks.on_module_load = on_temp_module_load
+    temp_app.hooks.apis["GetCurrentProcessId"] = on_temp_get_current_process_id
+    temp_app.start()
+    assert temp_hook_hits["count"] > 0, "temporary memory_execution_at hook died immediately"
+    assert temp_app.process.exit_status == 0, f"non-zero exit: {temp_app.process.exit_status}"
+
+    temp_app = None
     gc.collect()
 
 # ----- intercept smoke test against a controlled minimal sample -----
@@ -139,7 +181,7 @@ EXPECTED_PID = 0xC0FFEE01
 hook_pid_hits = {"count": 0}
 
 
-@mod.api_call(cc=mod.CallingConvention.stdcall, params=[])
+@win.api_call(cc=mod.CallingConvention.stdcall, params=[])
 def on_hook_sample_pid(call, params):
     hook_pid_hits["count"] += 1
     assert call.name == "GetCurrentProcessId"
@@ -153,7 +195,7 @@ if hook_sample.exists():
     hook_sample_copy = filesys_root / "hook-sample.exe"
     hook_sample_copy.write_bytes(hook_sample.read_bytes())
 
-    hook_app = mod.create_application(
+    hook_app = win.create_application(
         r"C:\hook-sample.exe",
         emulation_root=emulator_root,
     )

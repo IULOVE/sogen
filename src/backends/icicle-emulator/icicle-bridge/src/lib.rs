@@ -1,7 +1,7 @@
 mod icicle;
 mod registers;
 
-use icicle::IcicleEmulator;
+use icicle::{IcicleEmulator, IcicleStopInfo};
 use registers::X86Register;
 use std::os::raw::c_void;
 
@@ -25,6 +25,20 @@ pub fn icicle_start(ptr: *mut c_void, count: usize) {
         let emulator = &mut *(ptr as *mut IcicleEmulator);
         emulator.start(count as u64);
     }
+}
+
+#[unsafe(no_mangle)]
+pub fn icicle_get_stop_info(ptr: *mut c_void, out: *mut IcicleStopInfo) -> i32 {
+    if out.is_null() {
+        return 0;
+    }
+
+    unsafe {
+        let emulator = &*(ptr as *mut IcicleEmulator);
+        *out = emulator.last_stop_info();
+    }
+
+    return 1;
 }
 
 #[unsafe(no_mangle)]
@@ -146,6 +160,14 @@ pub fn icicle_restore_registers(ptr: *mut c_void, data: *const c_void, size: usi
         let emulator = &mut *(ptr as *mut IcicleEmulator);
         let u8_slice = std::slice::from_raw_parts(data as *const u8, size);
         emulator.restore_registers(u8_slice);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn icicle_reset_volatile_state(ptr: *mut c_void) {
+    unsafe {
+        let emulator = &mut *(ptr as *mut IcicleEmulator);
+        emulator.reset_volatile_state();
     }
 }
 
@@ -296,6 +318,24 @@ pub fn icicle_add_execution_hook(
     unsafe {
         let emulator = &mut *(ptr as *mut IcicleEmulator);
         return emulator.add_execution_hook(address, Box::new(move |ptr: u64| callback(data, ptr)));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn icicle_add_ranged_execution_hook(
+    ptr: *mut c_void,
+    address: u64,
+    size: u64,
+    callback: PtrFunction,
+    data: *mut c_void,
+) -> u32 {
+    unsafe {
+        let emulator = &mut *(ptr as *mut IcicleEmulator);
+        return emulator.add_ranged_execution_hook(
+            address,
+            size,
+            Box::new(move |ptr: u64| callback(data, ptr)),
+        );
     }
 }
 

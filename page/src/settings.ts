@@ -1,5 +1,7 @@
 import { parse } from "shell-quote";
 
+export type EmulatorMode = "windows" | "linux";
+
 export interface EnvironmentVariable {
   name: string;
   value: string;
@@ -17,6 +19,7 @@ export interface Settings {
   interestingModules: string[];
   environmentVariables: EnvironmentVariable[];
   commandLine: string;
+  mode: EmulatorMode;
 }
 
 export interface TranslatedSettings {
@@ -37,6 +40,7 @@ export function createDefaultSettings(): Settings {
     interestingModules: [],
     environmentVariables: [],
     commandLine: "",
+    mode: "windows",
   };
 }
 
@@ -70,61 +74,68 @@ export function translateSettings(settings: Settings): TranslatedSettings {
   const switches: string[] = [];
   const options: string[] = [];
 
-  switch (settings.logging) {
-    case "verbose":
-      switches.push("-v");
-      break;
-    case "silent":
-      switches.push("-s");
-      break;
-    case "concise":
-      switches.push("-c");
-      break;
-    case "very-concise":
-      switches.push("-vc");
-      break;
+  if (settings.mode === "linux") {
+    if (settings.logging === "verbose") {
+      switches.push("--verbose");
+    }
+  } else {
+    switch (settings.logging) {
+      case "verbose":
+        switches.push("--verbose");
+        break;
+      case "silent":
+        switches.push("--silent");
+        break;
+      case "concise":
+        switches.push("--concise");
+        break;
+      case "very-concise":
+        switches.push("--very-concise");
+        break;
 
-    default:
-      break;
-  }
-
-  if (settings.bufferStdout) {
-    switches.push("-b");
-  }
-
-  if (settings.execAccess) {
-    switches.push("-x");
-  }
-
-  if (settings.foreignAccess) {
-    switches.push("-f");
-  }
-
-  if (settings.instructionSummary) {
-    switches.push("-is");
-  }
-
-  settings.ignoredFunctions.forEach((f) => {
-    switches.push("-i");
-    switches.push(f);
-  });
-
-  settings.interestingModules.forEach((m) => {
-    switches.push("-m");
-    switches.push(m);
-  });
-
-  settings.environmentVariables.forEach((variable) => {
-    const name = variable.name.trim();
-    if (!name) {
-      return;
+      default:
+        break;
     }
 
-    switches.push("--env");
-    switches.push(name);
-    switches.push(variable.value);
-  });
+    if (settings.bufferStdout) {
+      switches.push("--buffer");
+    }
 
+    if (settings.execAccess) {
+      switches.push("--exec");
+    }
+
+    if (settings.foreignAccess) {
+      switches.push("--foreign");
+    }
+
+    if (settings.instructionSummary) {
+      switches.push("--inst-summary");
+    }
+
+    settings.ignoredFunctions.forEach((f) => {
+      switches.push("--ignore");
+      switches.push(f);
+    });
+
+    settings.interestingModules.forEach((m) => {
+      switches.push("--module");
+      switches.push(m);
+    });
+  }
+
+  if (settings.mode !== "linux") {
+    settings.environmentVariables.forEach((variable) => {
+      const name = variable.name.trim();
+      if (!name) {
+        return;
+      }
+
+      switches.push("--env");
+      switches.push(name);
+      switches.push(variable.value);
+    });
+  }
   try {
     const argv = parse(settings.commandLine) as string[];
     options.push(...argv);

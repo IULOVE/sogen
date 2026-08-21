@@ -193,6 +193,59 @@ namespace
         return !computername.empty() && blub == "LUL";
     }
 
+    bool test_lookup_account_sid()
+    {
+        HANDLE token{};
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        {
+            return false;
+        }
+
+        const auto close_token = sogen::utils::finally([&] { CloseHandle(token); });
+
+        DWORD size = 0;
+        GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || size < sizeof(TOKEN_USER))
+        {
+            return false;
+        }
+
+        std::vector<std::byte> buffer(size);
+        if (!GetTokenInformation(token, TokenUser, buffer.data(), size, &size))
+        {
+            return false;
+        }
+
+        const auto& token_user = *reinterpret_cast<const TOKEN_USER*>(buffer.data());
+        if (token_user.User.Sid == nullptr || IsValidSid(token_user.User.Sid) == FALSE)
+        {
+            return false;
+        }
+
+        DWORD name_size = 0;
+        DWORD domain_size = 0;
+        SID_NAME_USE use = SidTypeUnknown;
+
+        LookupAccountSidW(nullptr, token_user.User.Sid, nullptr, &name_size, nullptr, &domain_size, &use);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || name_size == 0 || domain_size == 0)
+        {
+            return false;
+        }
+
+        std::wstring name(name_size, L'\0');
+        std::wstring domain(domain_size, L'\0');
+
+        if (!LookupAccountSidW(nullptr, token_user.User.Sid, name.data(), &name_size, domain.data(), &domain_size, &use))
+        {
+            return false;
+        }
+
+        name.resize(name_size);
+        domain.resize(domain_size);
+
+        return !name.empty() && !domain.empty() && use == SidTypeUser;
+    }
+
     bool test_file_path_io(const std::filesystem::path& filename)
     {
         std::error_code ec{};
@@ -256,7 +309,7 @@ namespace
         const auto filename = std::filesystem::absolute("a.txt");
         constexpr DWORD pending_byte = 0x40000000UL;
 
-        const auto cleanup_file = utils::finally([&] { DeleteFileW(filename.c_str()); });
+        const auto cleanup_file = sogen::utils::finally([&] { DeleteFileW(filename.c_str()); });
 
         HANDLE first = CreateFileW(filename.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                    nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -266,7 +319,7 @@ namespace
             return false;
         }
 
-        const auto cleanup_first = utils::finally([&] { CloseHandle(first); });
+        const auto cleanup_first = sogen::utils::finally([&] { CloseHandle(first); });
 
         OVERLAPPED first_lock{};
         first_lock.Offset = pending_byte;
@@ -293,6 +346,23 @@ namespace
         if (!UnlockFileEx(first, 0, 1, 0, &second_lock))
         {
             puts("Failed to unlock reacquired file lock");
+            return false;
+        }
+
+        constexpr DWORD negative_length_low = 0xFFFFFFFFUL;
+        constexpr DWORD negative_length_high = 0xFFFFFFFFUL;
+
+        OVERLAPPED negative_lock{};
+        if (!LockFileEx(first, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, negative_length_low, negative_length_high,
+                        &negative_lock))
+        {
+            puts("Failed to acquire negative-length file lock");
+            return false;
+        }
+
+        if (!UnlockFileEx(first, 0, negative_length_low, negative_length_high, &negative_lock))
+        {
+            puts("Failed to unlock negative-length file lock");
             return false;
         }
 
@@ -727,11 +797,11 @@ namespace
         const auto query_status = DnsQuery_A(hostname, DNS_TYPE_A, DNS_QUERY_STANDARD, nullptr, &records, nullptr);
         if (query_status != ERROR_SUCCESS)
         {
-            puts("DnsQuery_A failed");
+            printf("DnsQuery_A failed: %ld\n", query_status);
             return false;
         }
 
-        const auto free_records = utils::finally([&] {
+        const auto free_records = sogen::utils::finally([&] {
             if (records)
             {
                 DnsRecordListFree(records, DnsFreeRecordList);
@@ -767,7 +837,7 @@ namespace
             return false;
         }
 
-        const auto free_results = utils::finally([&] {
+        const auto free_results = sogen::utils::finally([&] {
             if (results)
             {
                 freeaddrinfo(results);
@@ -1111,9 +1181,94 @@ namespace
         return executions == 2;
     }
 
+    bool test_window_geometry()
+    {
+        WNDCLASSEXA wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpszClassName = "TestWindowNonclientClass";
+        wc.hInstance = GetModuleHandleA(nullptr);
+        wc.lpfnWndProc = DefWindowProcA;
+
+        if (!RegisterClassExA(&wc))
+        {
+            puts("Failed to register window class");
+            return false;
+        }
+
+        const auto unregister_class = sogen::utils::finally([&] { UnregisterClassA(wc.lpszClassName, wc.hInstance); });
+
+        struct window_case
+        {
+            DWORD style;
+            DWORD ex_style;
+        };
+
+        constexpr std::array cases = {
+            window_case{.style = WS_POPUP | WS_THICKFRAME, .ex_style = 0},
+            window_case{.style = WS_POPUP | WS_CAPTION, .ex_style = 0},
+            window_case{.style = WS_POPUP | WS_DLGFRAME, .ex_style = 0},
+            window_case{.style = WS_POPUP, .ex_style = WS_EX_CLIENTEDGE},
+        };
+
+        for (const auto& test : cases)
+        {
+            constexpr LONG expected_client_height = 123;
+            constexpr LONG expected_client_width = 321;
+
+            RECT adjusted_rect{0, 0, expected_client_width, expected_client_height};
+            const BOOL adjusted = test.ex_style ? AdjustWindowRectEx(&adjusted_rect, test.style, FALSE, test.ex_style)
+                                                : AdjustWindowRect(&adjusted_rect, test.style, FALSE);
+            if (!adjusted)
+            {
+                puts("Failed to calculate nonclient insets");
+                return false;
+            }
+
+            const auto adjusted_width = adjusted_rect.right - adjusted_rect.left;
+            const auto adjusted_height = adjusted_rect.bottom - adjusted_rect.top;
+
+            const HWND hwnd = CreateWindowExA(test.ex_style, wc.lpszClassName, nullptr, test.style, 0, 0, adjusted_width, adjusted_height,
+                                              nullptr, nullptr, wc.hInstance, nullptr);
+            if (!hwnd)
+            {
+                puts("Failed to create test window");
+                return false;
+            }
+
+            const auto destroy_window = sogen::utils::finally([&] { DestroyWindow(hwnd); });
+
+            RECT window_rect{};
+            RECT client_rect{};
+            if (!GetWindowRect(hwnd, &window_rect) || !GetClientRect(hwnd, &client_rect))
+            {
+                return false;
+            }
+
+            const auto window_width = window_rect.right - window_rect.left;
+            const auto window_height = window_rect.bottom - window_rect.top;
+            const auto client_width = client_rect.right - client_rect.left;
+            const auto client_height = client_rect.bottom - client_rect.top;
+
+            if (window_width != adjusted_width || window_height != adjusted_height)
+            {
+                puts("Window size does not match AdjustWindowRect result");
+                return false;
+            }
+
+            if (client_width != expected_client_width || client_height != expected_client_height)
+            {
+                puts("AdjustWindowRect round-trip failed");
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     bool test_message_queue()
     {
-        static thread_local UINT wnd_proc_num = 0;
+        thread_local UINT wnd_proc_num = 0;
+        thread_local UINT destroy_count = 0;
         static const UINT wnd_msg_id = WM_APP + 2;
 
         WNDCLASSEXA wc = {};
@@ -1137,6 +1292,19 @@ namespace
                     return 777;
                 }
             }
+            else if (msg == WM_CLOSE)
+            {
+                wnd_proc_num += 1;
+                if (wnd_proc_num == 2)
+                {
+                    return 0;
+                }
+            }
+            else if (msg == WM_DESTROY)
+            {
+                ++destroy_count;
+                PostQuitMessage(42);
+            }
             return DefWindowProcA(hwnd, msg, wp, lp);
         };
 
@@ -1146,22 +1314,23 @@ namespace
             return false;
         }
 
+        const auto unregister_class = sogen::utils::finally([&] { UnregisterClassA(wc.lpszClassName, wc.hInstance); });
+
         HWND hwnd = CreateWindowExA(0, wc.lpszClassName, nullptr, 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance,
                                     reinterpret_cast<void*>(0x1337));
         if (!hwnd || wnd_proc_num != 1)
         {
             puts("Failed to create message window");
-            UnregisterClassA(wc.lpszClassName, wc.hInstance);
             return false;
         }
+
+        const auto destroy_window = sogen::utils::finally([&] { DestroyWindow(hwnd); });
 
         const LRESULT send_res = SendMessageA(hwnd, wnd_msg_id, 123, 456);
 
         if (send_res != 777 || wnd_proc_num != 2)
         {
             puts("SendMessage failed");
-            DestroyWindow(hwnd);
-            UnregisterClassA(wc.lpszClassName, wc.hInstance);
             return false;
         }
 
@@ -1169,8 +1338,6 @@ namespace
         if (!PostMessageA(hwnd, wnd_msg_id, 123, 456))
         {
             puts("PostMessage failed");
-            DestroyWindow(hwnd);
-            UnregisterClassA(wc.lpszClassName, wc.hInstance);
             return false;
         }
 
@@ -1178,16 +1345,12 @@ namespace
         if (GetMessageA(&msg, hwnd, 0, 0) <= 0)
         {
             puts("GetMessage failed or returned WM_QUIT unexpectedly");
-            DestroyWindow(hwnd);
-            UnregisterClassA(wc.lpszClassName, wc.hInstance);
             return false;
         }
 
         if (msg.message != wnd_msg_id)
         {
             puts("Retrieved message is not the expected custom message");
-            DestroyWindow(hwnd);
-            UnregisterClassA(wc.lpszClassName, wc.hInstance);
             return false;
         }
 
@@ -1197,42 +1360,266 @@ namespace
         if (wnd_proc_num != 1)
         {
             puts("Posted window message did not execute WndProc");
-            DestroyWindow(hwnd);
-            UnregisterClassA(wc.lpszClassName, wc.hInstance);
             return false;
         }
 
-        constexpr int quit_code = 42;
-        PostQuitMessage(quit_code);
+        SendMessageA(hwnd, WM_CLOSE, 0, 0);
+        if (!IsWindow(hwnd) || destroy_count != 0)
+        {
+            puts("WndProc unexpectedly destroyed the window on cancelled WM_CLOSE");
+            return false;
+        }
+
+        SendMessageA(hwnd, WM_CLOSE, 0, 0);
+        if (IsWindow(hwnd) || destroy_count != 1)
+        {
+            puts("DefWindowProc did not destroy the window on WM_CLOSE");
+            return false;
+        }
+        hwnd = nullptr;
 
         const BOOL quit_result = GetMessageA(&msg, nullptr, 0, 0);
         if (quit_result != 0)
         {
             puts("GetMessage did not return 0 for WM_QUIT");
-            DestroyWindow(hwnd);
-            UnregisterClassA(wc.lpszClassName, wc.hInstance);
             return false;
         }
 
         if (msg.message != WM_QUIT)
         {
             puts("Message is not WM_QUIT");
-            DestroyWindow(hwnd);
-            UnregisterClassA(wc.lpszClassName, wc.hInstance);
             return false;
         }
 
-        if (msg.wParam != quit_code)
+        if (msg.wParam != 42)
         {
             puts("WM_QUIT exit code mismatch");
-            DestroyWindow(hwnd);
-            UnregisterClassA(wc.lpszClassName, wc.hInstance);
             return false;
         }
 
-        DestroyWindow(hwnd);
-        UnregisterClassA(wc.lpszClassName, wc.hInstance);
         return true;
+    }
+
+    bool test_paint_message_queue()
+    {
+        struct paint_state
+        {
+            HWND window{};
+            int ncpaint{};
+            int erase{};
+            int paint{};
+        };
+
+        thread_local paint_state* active_paint_state{};
+
+        WNDCLASSEXA wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpszClassName = "TestPaintMsgQueueClass";
+        wc.hInstance = GetModuleHandleA(nullptr);
+        wc.lpfnWndProc = [](const HWND hwnd, const UINT message, const WPARAM w_param, const LPARAM l_param) -> LRESULT {
+            if (active_paint_state && hwnd == active_paint_state->window)
+            {
+                if (message == WM_NCPAINT)
+                {
+                    ++active_paint_state->ncpaint;
+                }
+                else if (message == WM_ERASEBKGND)
+                {
+                    ++active_paint_state->erase;
+                    RECT client_rect{};
+                    GetClientRect(hwnd, &client_rect);
+                    FillRect(reinterpret_cast<HDC>(w_param), &client_rect, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+                    return TRUE;
+                }
+                else if (message == WM_PAINT)
+                {
+                    ++active_paint_state->paint;
+                    PAINTSTRUCT paint{};
+                    BeginPaint(hwnd, &paint);
+                    EndPaint(hwnd, &paint);
+                    return 0;
+                }
+            }
+
+            return DefWindowProcA(hwnd, message, w_param, l_param);
+        };
+
+        if (!RegisterClassExA(&wc))
+        {
+            puts("Failed to register paint window class");
+            return false;
+        }
+
+        const auto unregister_class = sogen::utils::finally([&] { UnregisterClassA(wc.lpszClassName, wc.hInstance); });
+
+        const HWND hwnd =
+            CreateWindowExA(0, wc.lpszClassName, nullptr, WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
+        if (!hwnd)
+        {
+            puts("Failed to create paint window");
+            return false;
+        }
+
+        const auto destroy_window = sogen::utils::finally([&] { DestroyWindow(hwnd); });
+
+        paint_state state{.window = hwnd};
+        active_paint_state = &state;
+        const auto clear_paint_state = sogen::utils::finally([&] { active_paint_state = nullptr; });
+
+        ShowWindow(hwnd, SW_SHOWDEFAULT);
+
+        RECT update_rect{};
+        if (state.ncpaint != 1 || state.erase != 1)
+        {
+            puts("ShowWindow did not synthesize nonclient and background paint");
+            return false;
+        }
+        if (state.paint != 0 || !GetUpdateRect(hwnd, &update_rect, FALSE))
+        {
+            puts("ShowWindow background paint unexpectedly validated the window");
+            return false;
+        }
+        if (!UpdateWindow(hwnd) || state.paint != 1 || GetUpdateRect(hwnd, &update_rect, FALSE))
+        {
+            puts("UpdateWindow did not paint and validate the window after ShowWindow");
+            return false;
+        }
+
+        RedrawWindow(hwnd, nullptr, nullptr, RDW_NOINTERNALPAINT | RDW_VALIDATE);
+        ValidateRect(hwnd, nullptr);
+
+        MSG msg = {};
+        while (PeekMessageA(&msg, hwnd, WM_PAINT, WM_PAINT, PM_REMOVE))
+        {
+            ValidateRect(hwnd, nullptr);
+        }
+
+        if (!RedrawWindow(hwnd, nullptr, nullptr, RDW_INTERNALPAINT))
+        {
+            puts("Failed to request internal paint");
+            return false;
+        }
+
+        if (!PeekMessageA(&msg, hwnd, WM_PAINT, WM_PAINT, PM_NOREMOVE))
+        {
+            puts("Internal WM_PAINT was not available");
+            return false;
+        }
+
+        if (PeekMessageA(&msg, hwnd, WM_PAINT, WM_PAINT, PM_NOREMOVE))
+        {
+            puts("PM_NOREMOVE did not consume internal WM_PAINT");
+            return false;
+        }
+
+        InvalidateRect(hwnd, nullptr, FALSE);
+        RedrawWindow(hwnd, nullptr, nullptr, RDW_INTERNALPAINT);
+
+        if (!PeekMessageA(&msg, hwnd, WM_PAINT, WM_PAINT, PM_REMOVE))
+        {
+            puts("Combined WM_PAINT was not available");
+            return false;
+        }
+
+        if (!PeekMessageA(&msg, hwnd, WM_PAINT, WM_PAINT, PM_NOREMOVE))
+        {
+            puts("PM_REMOVE consumed the invalid update region");
+            return false;
+        }
+
+        ValidateRect(hwnd, nullptr);
+
+        return true;
+    }
+
+    bool test_mutable_callbacks()
+    {
+        struct test_state
+        {
+            int changing_count{};
+            int size_width{};
+            int size_height{};
+            UINT changed_flags{};
+            bool mutate{true};
+            bool saw_size{};
+            bool saw_changed{};
+        };
+
+        thread_local test_state* active_state{};
+        test_state state{};
+        active_state = &state;
+
+        WNDCLASSEXA wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpszClassName = "TestMutMsgQueueClass";
+        wc.hInstance = GetModuleHandleA(nullptr);
+        wc.lpfnWndProc = [](HWND hwnd, const UINT msg, const WPARAM wp, const LPARAM lp) -> LRESULT {
+            if (active_state && msg == WM_WINDOWPOSCHANGING && active_state->mutate)
+            {
+                auto& position = *reinterpret_cast<WINDOWPOS*>(lp);
+                position.x = -123;
+                position.y = -456;
+                position.cx = 800;
+                position.cy = 600;
+                position.flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
+                ++active_state->changing_count;
+            }
+            else if (active_state && msg == WM_WINDOWPOSCHANGED)
+            {
+                active_state->changed_flags = reinterpret_cast<const WINDOWPOS*>(lp)->flags;
+                active_state->saw_changed = true;
+            }
+            else if (active_state && msg == WM_SIZE)
+            {
+                active_state->size_width = LOWORD(lp);
+                active_state->size_height = HIWORD(lp);
+                active_state->saw_size = true;
+            }
+
+            return DefWindowProcA(hwnd, msg, wp, lp);
+        };
+
+        if (!RegisterClassExA(&wc))
+        {
+            active_state = nullptr;
+            return false;
+        }
+
+        HWND hwnd{};
+        const auto cleanup = sogen::utils::finally([&] {
+            state.mutate = false;
+            if (hwnd)
+            {
+                DestroyWindow(hwnd);
+            }
+            UnregisterClassA(wc.lpszClassName, wc.hInstance);
+            active_state = nullptr;
+        });
+
+        hwnd = CreateWindowExA(0, wc.lpszClassName, nullptr, WS_OVERLAPPEDWINDOW | WS_VISIBLE, 10, 20, 320, 240, nullptr, nullptr,
+                               wc.hInstance, nullptr);
+        state.mutate = false;
+        if (!hwnd)
+        {
+            return false;
+        }
+
+        RECT window_rect{};
+        RECT client_rect{};
+        if (!GetWindowRect(hwnd, &window_rect) || !GetClientRect(hwnd, &client_rect))
+        {
+            return false;
+        }
+
+        const auto window_width = window_rect.right - window_rect.left;
+        const auto window_height = window_rect.bottom - window_rect.top;
+        const auto client_width = client_rect.right - client_rect.left;
+        const auto client_height = client_rect.bottom - client_rect.top;
+
+        return state.changing_count == 2 && state.saw_changed && (state.changed_flags & SWP_SHOWWINDOW) != 0 && state.saw_size &&
+               window_rect.left == -123 && window_rect.top == -456 && window_width == 800 && window_height == 600 &&
+               client_width < window_width && client_height < window_height && state.size_width == client_width &&
+               state.size_height == client_height;
     }
 
     bool test_private_namespace()
@@ -1267,7 +1654,7 @@ namespace
         std::array<HANDLE, 2> boundary{};
         std::array<HANDLE, 5> ns{};
 
-        const auto _ = utils::finally([&]() {
+        const auto _ = sogen::utils::finally([&]() {
             for (auto* elem : boundary)
             {
                 if (elem)
@@ -1410,6 +1797,94 @@ namespace
 
         return t1 != t0;
     }
+
+    bool test_settimer()
+    {
+        MSG msg = {};
+        while (PeekMessageA(&msg, nullptr, WM_TIMER, WM_TIMER, PM_REMOVE))
+        {
+        }
+
+        HANDLE dummy_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!dummy_event)
+        {
+            puts("CreateEventW failed");
+            return false;
+        }
+
+        const auto cleanup_event = sogen::utils::finally([&] { CloseHandle(dummy_event); });
+
+        const UINT_PTR timer_id = SetTimer(nullptr, 0, 10, nullptr);
+        if (!timer_id)
+        {
+            puts("SetTimer failed");
+            return false;
+        }
+
+        const auto cleanup_timer = sogen::utils::finally([&] { KillTimer(nullptr, timer_id); });
+
+        const DWORD wait_result = MsgWaitForMultipleObjects(1, &dummy_event, FALSE, 1000, QS_TIMER);
+
+        if (wait_result != WAIT_OBJECT_0 + 1)
+        {
+            printf("MsgWaitForMultipleObjects returned unexpected result: %lu\n", wait_result);
+            return false;
+        }
+
+        if (!PeekMessageA(&msg, nullptr, WM_TIMER, WM_TIMER, PM_REMOVE))
+        {
+            puts("Expected WM_TIMER message was not available");
+            return false;
+        }
+
+        if (msg.message != WM_TIMER)
+        {
+            puts("Received message was not WM_TIMER");
+            return false;
+        }
+
+        if (msg.hwnd != nullptr)
+        {
+            puts("Expected a thread timer, but WM_TIMER had a window handle");
+            return false;
+        }
+
+        if (msg.wParam != timer_id)
+        {
+            puts("WM_TIMER timer id mismatch");
+            return false;
+        }
+
+        return true;
+    }
+
+    bool test_gdi()
+    {
+        const wchar_t* cursor_path = L"C:\\Windows\\Cursors\\aero_arrow.cur";
+
+        const auto attrs = GetFileAttributesW(cursor_path);
+        if (attrs == INVALID_FILE_ATTRIBUTES)
+        {
+            puts("aero_arrow.cur does not exist");
+            return false;
+        }
+
+        if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        {
+            puts("aero_arrow.cur is not a file");
+            return false;
+        }
+
+        const HCURSOR cursor = LoadCursorFromFileW(cursor_path);
+        if (!cursor)
+        {
+            puts("LoadCursorFromFileW failed to load aero_arrow.cur");
+            return false;
+        }
+
+        DestroyCursor(cursor);
+        return true;
+    }
 }
 
 #define RUN_TEST(func, name)                 \
@@ -1430,8 +1905,9 @@ int main(const int argc, const char* argv[])
 
     bool valid = true;
 
-    (void)&test_dns;
-    // RUN_TEST(test_dns, "DNS")
+#ifdef _WIN64
+    RUN_TEST(test_dns, "DNS")
+#endif
     RUN_TEST(test_io, "I/O")
     RUN_TEST(test_file_locking, "File Locking")
     RUN_TEST(test_dir_io, "Dir I/O")
@@ -1446,26 +1922,28 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_threads, "Threads")
     RUN_TEST(test_threads_winapi, "Threads WinAPI")
     RUN_TEST(test_env, "Environment")
+    RUN_TEST(test_lookup_account_sid, "LSA")
     RUN_TEST(test_exceptions, "Exceptions")
 #ifndef __MINGW64__
     RUN_TEST(test_native_exceptions, "Native Exceptions")
 #endif
-#ifdef _WIN64
     if (!getenv("EMULATOR_ICICLE"))
     {
         RUN_TEST(test_interrupts, "Interrupts")
     }
-#endif
     RUN_TEST(test_tls, "TLS")
     RUN_TEST(test_socket, "Socket")
     RUN_TEST(test_apc, "APC")
+    RUN_TEST(test_window_geometry, "Window Geometry")
     RUN_TEST(test_user_callback, "User Callback")
-#ifdef _WIN64
-    RUN_TEST(test_message_queue, "Message Queue")
-#endif
+    RUN_TEST(test_mutable_callbacks, "Mutable User Callback")
+    RUN_TEST(test_message_queue, "Message Queue (General)")
+    RUN_TEST(test_paint_message_queue, "Message Queue (Paint)")
+    RUN_TEST(test_settimer, "User Timer")
     RUN_TEST(test_private_namespace, "Private Namespace")
     RUN_TEST(test_actctx, "Activation Context")
     RUN_TEST(test_mmio, "MMIO")
+    RUN_TEST(test_gdi, "GDI")
 
     return valid ? 0 : 1;
 }

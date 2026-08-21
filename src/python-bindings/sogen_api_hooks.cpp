@@ -1,8 +1,9 @@
 #include "sogen_internal.hpp"
+#include <windows_emulator.hpp>
 
 #include <cstdio>
 
-namespace sogen_py
+namespace sogen::py
 {
     namespace
     {
@@ -57,58 +58,75 @@ namespace sogen_py
 
     // ----- hook_handle -----
 
-    hook_handle::hook_handle(windows_emulator& emulator, emulator_hook* hook, nb::object owner)
+    hook_handle::hook_state::hook_state(sogen::x86_64_emulator& emulator, emulator_hook* hook)
         : emu(&emulator),
-          hook(hook),
-          owner(std::move(owner))
+          hook(hook)
     {
     }
 
-    hook_handle::~hook_handle()
+    hook_handle::hook_state::hook_state(std::function<void()> remover)
+        : remover(std::move(remover))
+    {
+    }
+
+    hook_handle::hook_state::~hook_state()
     {
         remove();
     }
 
-    hook_handle::hook_handle(hook_handle&& other) noexcept
-        : emu(other.emu),
-          hook(other.hook),
-          owner(std::move(other.owner))
+    void hook_handle::hook_state::remove()
     {
-        other.emu = nullptr;
-        other.hook = nullptr;
-    }
-
-    hook_handle& hook_handle::operator=(hook_handle&& other) noexcept
-    {
-        if (this != &other)
+        if (this->remover)
         {
-            remove();
-            emu = other.emu;
-            hook = other.hook;
-            owner = std::move(other.owner);
-            other.emu = nullptr;
-            other.hook = nullptr;
+            auto remove_callback = std::move(this->remover);
+            this->remover = {};
+            this->hook = nullptr;
+            this->emu = nullptr;
+            try
+            {
+                remove_callback();
+            }
+            catch (...)
+            {
+            }
+            return;
         }
 
-        return *this;
-    }
-
-    void hook_handle::remove()
-    {
         if (!this->emu || !this->hook)
         {
             return;
         }
 
+        auto* hook_to_remove = this->hook;
+        this->hook = nullptr;
+
         try
         {
-            this->emu->emu().delete_hook(this->hook);
+            this->emu->delete_hook(hook_to_remove);
         }
         catch (...)
         {
         }
+    }
 
-        this->hook = nullptr;
+    hook_handle::hook_handle(sogen::x86_64_emulator& emulator, emulator_hook* hook, nb::object owner)
+        : shared_state(std::make_shared<hook_state>(emulator, hook)),
+          owner(std::move(owner))
+    {
+    }
+
+    hook_handle::hook_handle(std::function<void()> remover, nb::object owner)
+        : shared_state(std::make_shared<hook_state>(std::move(remover))),
+          owner(std::move(owner))
+    {
+    }
+
+    void hook_handle::remove() const
+    {
+        if (this->shared_state)
+        {
+            this->shared_state->remove();
+        }
     }
 
     // ----- api_hook_registry -----
@@ -259,7 +277,7 @@ namespace sogen_py
             return;
         }
 
-        auto* hook = this->win_emu->emu().hook_memory_execution([this](uint64_t address) {
+        auto* hook = this->win_emu->emu().hook_memory_execution([this](cpu_interface&, uint64_t address) {
             try
             {
                 this->dispatch_address(address);
@@ -268,7 +286,7 @@ namespace sogen_py
             {
             }
         });
-        this->execution_hook.emplace(*this->win_emu, hook, nb::none());
+        this->execution_hook.emplace(this->win_emu->emu(), hook, nb::none());
     }
 
     void api_hook_registry::remove_execution_hook()

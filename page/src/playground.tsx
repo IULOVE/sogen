@@ -1,4 +1,5 @@
 import React from "react";
+import { attachSogenUiHost } from "./web-ui-host";
 
 import { Output } from "@/components/output";
 
@@ -7,6 +8,8 @@ import {
   Filesystem,
   setupFilesystem,
   windowsToInternalPath,
+  setupLinuxFilesystem,
+  runtimeRoots,
 } from "./filesystem";
 
 import { memory64 } from "wasm-feature-detect";
@@ -29,8 +32,10 @@ import {
   HouseFill,
   FileEarmarkArrowDownFill,
   Memory,
+  BugFill,
 } from "react-bootstrap-icons";
 import { MemoryView } from "./components/memory-view";
+import { DebuggerView } from "./components/debugger-view";
 import { StatusIndicator } from "@/components/status-indicator";
 import { Header } from "./Header";
 
@@ -65,7 +70,10 @@ export interface PlaygroundState {
   application?: string;
   drawerOpen: boolean;
   memoryViewOpen: boolean;
+  debuggerOpen: boolean;
   allowWasm64: boolean;
+  uiWindowCount: number;
+  uiPanelWidth: number;
   file?: PlaygroundFile;
 }
 
@@ -136,12 +144,16 @@ export class Playground extends React.Component<
   PlaygroundState
 > {
   private output: React.RefObject<Output | null>;
+  private uiCanvas: React.RefObject<HTMLCanvasElement | null>;
+  private uiHostDispose?: () => void;
+  private uiPanelDragging = false;
   private iconCache: Map<string, string | null> = new Map();
 
   constructor(props: PlaygroundProps) {
     super(props);
 
     this.output = React.createRef();
+    this.uiCanvas = React.createRef();
 
     this.start = this.start.bind(this);
     this.resetFilesys = this.resetFilesys.bind(this);
@@ -153,7 +165,10 @@ export class Playground extends React.Component<
       settings: loadSettings(),
       drawerOpen: false,
       memoryViewOpen: false,
+      debuggerOpen: false,
       allowWasm64: false,
+      uiWindowCount: 0,
+      uiPanelWidth: Math.min(720, Math.round(window.innerWidth * 0.45)),
       file: decodeFileData(getEmulateData()),
     };
   }
@@ -163,14 +178,42 @@ export class Playground extends React.Component<
       this.setState({ allowWasm64 });
     });
 
+    window.addEventListener("mousemove", this.onUiPanelResizeMove);
+    window.addEventListener("mouseup", this.onUiPanelResizeEnd);
+
     if (this.state.file) {
       this.emulateRemoteFile(this.state.file);
     }
   }
 
   componentWillUnmount(): void {
+    window.removeEventListener("mousemove", this.onUiPanelResizeMove);
+    window.removeEventListener("mouseup", this.onUiPanelResizeEnd);
+    document.body.style.userSelect = "";
+    this.uiPanelDragging = false;
+    this.uiHostDispose?.();
     this.state.emulator?.stop();
   }
+
+  onUiPanelResizeMove = (event: MouseEvent) => {
+    if (!this.uiPanelDragging) {
+      return;
+    }
+
+    const next = window.innerWidth - event.clientX;
+    this.setState({
+      uiPanelWidth: Math.min(Math.max(next, 320), window.innerWidth - 160),
+    });
+  };
+
+  onUiPanelResizeEnd = () => {
+    if (!this.uiPanelDragging) {
+      return;
+    }
+
+    this.uiPanelDragging = false;
+    document.body.style.userSelect = "";
+  };
 
   resetFilesystemState() {
     this.setState({
@@ -214,22 +257,28 @@ export class Playground extends React.Component<
       return this.state.filesystemPromise;
     }
 
+    const isLinux = this.state.settings.mode === "linux";
+
     const promise = new Promise<Filesystem>((resolve, reject) => {
       if (!force) {
         this.output.current?.clear();
         this.logLine("Loading filesystem...");
       }
 
-      setupFilesystem(
-        (current, total, file) => {
-          this.logLine(`Processing filesystem (${current}/${total}): ${file}`);
-        },
-        (percent) => {
-          this.logLine(`Downloading filesystem: ${percent}%`);
-        },
-      )
-        .then(resolve)
-        .catch(reject);
+      const setup = isLinux
+        ? setupLinuxFilesystem()
+        : setupFilesystem(
+            (current, total, file) => {
+              this.logLine(
+                `Processing filesystem (${current}/${total}): ${file}`,
+              );
+            },
+            (percent) => {
+              this.logLine(`Downloading filesystem: ${percent}%`);
+            },
+          );
+
+      setup.then(resolve).catch(reject);
     });
 
     promise.then((filesystem) => this.setState({ filesystem }));
@@ -259,9 +308,14 @@ export class Playground extends React.Component<
       },
     );
 
+    const isLinux = this.state.settings.mode === "linux";
+    const internalPath = isLinux
+      ? `${runtimeRoots.linux}/${file.file}`
+      : windowsToInternalPath(file.file);
+
     await fs.storeFiles([
       {
-        name: windowsToInternalPath(file.file),
+        name: internalPath,
         data: fileData,
       },
     ]);
@@ -322,16 +376,36 @@ export class Playground extends React.Component<
 
     const persistFs = this.state.settings.persist;
 
+    const mode = this.state.settings.mode;
     const new_emulator = new Emulator(
       (l) => this.logLines(l),
       (s) => this._onEmulatorStateChanged(s, persistFs),
       (s) => this._onEmulatorStatusChanged(s),
+      mode,
     );
     //new_emulator.onTerminate().then(() => this.setState({ emulator: null }));
 
-    this.setState({ emulator: new_emulator, application: userFile });
+    this.uiHostDispose?.();
+    this.uiHostDispose = undefined;
+    if (this.uiCanvas.current) {
+      const host = attachSogenUiHost(
+        new_emulator.worker,
+        this.uiCanvas.current,
+        {
+          onWindowCountChanged: (uiWindowCount) =>
+            this.setState({ uiWindowCount }),
+        },
+      );
+      this.uiHostDispose = host.dispose;
+    }
 
-    new_emulator.start(this.state.settings, userFile);
+    this.setState({
+      emulator: new_emulator,
+      application: userFile,
+      uiWindowCount: 0,
+    });
+
+    new_emulator.start(this.state.settings, userFile, this.state.debuggerOpen);
   }
 
   render() {
@@ -339,7 +413,7 @@ export class Playground extends React.Component<
       <>
         <Header
           title="Sogen - Playground"
-          description="Playground to test and run Sogen, a Windows user space emulator, right in your browser."
+          description="Playground to test and run Sogen, a Windows and Linux user space emulator, right in your browser."
         />
         <div className="h-dvh flex flex-col">
           <header className="flex shrink-0 items-center gap-2 border-b p-2 overflow-y-auto">
@@ -415,6 +489,18 @@ export class Playground extends React.Component<
                   allowWasm64={this.state.allowWasm64}
                   onChange={(s) => {
                     saveSettings(s);
+
+                    if (this.state.settings.mode !== s.mode) {
+                      this.state.emulator?.stop();
+                      this.resetFilesystemState();
+                      this.setState({
+                        settings: s,
+                        emulator: undefined,
+                        emulationStatus: undefined,
+                      });
+                      return;
+                    }
+
                     this.setState({ settings: s });
                   }}
                 />
@@ -451,7 +537,27 @@ export class Playground extends React.Component<
                 this.setState({ memoryViewOpen: !this.state.memoryViewOpen })
               }
             >
-              <Memory /> <span className="hidden sm:inline">Memory View</span>
+              <Memory /> <span className="hidden sm:inline">Memory</span>
+            </Button>
+
+            <Button
+              disabled={
+                !!this.state.emulator &&
+                this.state.emulator.getState() === EmulationState.Running
+              }
+              size="sm"
+              title={
+                !this.state.emulator || this.isEmulatorPaused()
+                  ? "Debugger"
+                  : "Pause emulation to debug"
+              }
+              variant={this.state.debuggerOpen ? "default" : "secondary"}
+              className="fancy"
+              onClick={() =>
+                this.setState({ debuggerOpen: !this.state.debuggerOpen })
+              }
+            >
+              <BugFill /> <span className="hidden sm:inline">Debugger</span>
             </Button>
 
             {!this.state.filesystem ? (
@@ -476,7 +582,8 @@ export class Playground extends React.Component<
                       iconCache={this.iconCache}
                       runFile={this.startEmulator}
                       resetFilesys={this.resetFilesys}
-                      path={["c"]}
+                      path={this.state.settings.mode === "linux" ? [] : ["c"]}
+                      linuxMode={this.state.settings.mode === "linux"}
                     />
                   </DrawerFooter>
                 </DrawerContent>
@@ -507,11 +614,56 @@ export class Playground extends React.Component<
                 <Output ref={this.output} />
               </div>
             </div>
+            <div
+              className={
+                this.state.uiWindowCount > 0
+                  ? "relative flex h-full shrink-0 flex-col border-l bg-background"
+                  : "relative flex h-full shrink-0 flex-col overflow-hidden border-l-0 bg-background"
+              }
+              style={{
+                width:
+                  this.state.uiWindowCount > 0
+                    ? `${this.state.uiPanelWidth}px`
+                    : "0px",
+                maxWidth: "100vw",
+              }}
+            >
+              <div
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  this.uiPanelDragging = true;
+                  document.body.style.userSelect = "none";
+                }}
+                title="Drag to resize"
+                className={
+                  this.state.uiWindowCount > 0
+                    ? "absolute inset-y-0 left-0 z-20 w-1.5 cursor-col-resize hover:bg-primary/40"
+                    : "hidden"
+                }
+              />
+              <div className="flex flex-1 flex-col p-2 min-h-0">
+                <div className="flex-1 rounded-md border bg-muted/20 p-2 min-h-0">
+                  <canvas
+                    ref={this.uiCanvas}
+                    width={960}
+                    height={640}
+                    className="h-full w-full rounded bg-background outline-none"
+                  />
+                </div>
+              </div>
+            </div>
             {this.state.memoryViewOpen && this.state.emulator && (
               <MemoryView
                 emulator={this.state.emulator}
                 paused={!!this.isEmulatorPaused()}
                 onClose={() => this.setState({ memoryViewOpen: false })}
+              />
+            )}
+            {this.state.debuggerOpen && this.state.emulator && (
+              <DebuggerView
+                emulator={this.state.emulator}
+                paused={!!this.isEmulatorPaused()}
+                onClose={() => this.setState({ debuggerOpen: false })}
               />
             )}
           </div>

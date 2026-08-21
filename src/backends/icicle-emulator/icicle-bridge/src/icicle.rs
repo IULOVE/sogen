@@ -22,6 +22,53 @@ const FOREIGN_READ: u8 = 1 << 0;
 const FOREIGN_WRITE: u8 = 1 << 1;
 const FOREIGN_EXEC: u8 = 1 << 2;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IcicleStopInfo {
+    pub kind: u32,
+    pub code: u32,
+    pub value: u64,
+}
+
+impl IcicleStopInfo {
+    const NONE: u32 = 0;
+    const INSTRUCTION_LIMIT: u32 = 1;
+    const UNHANDLED_EXCEPTION: u32 = 2;
+    const OTHER: u32 = 3;
+
+    fn none() -> Self {
+        Self {
+            kind: Self::NONE,
+            code: 0,
+            value: 0,
+        }
+    }
+
+    fn instruction_limit() -> Self {
+        Self {
+            kind: Self::INSTRUCTION_LIMIT,
+            code: 0,
+            value: 0,
+        }
+    }
+
+    fn unhandled_exception(code: ExceptionCode, value: u64) -> Self {
+        Self {
+            kind: Self::UNHANDLED_EXCEPTION,
+            code: code as u32,
+            value,
+        }
+    }
+
+    fn other() -> Self {
+        Self {
+            kind: Self::OTHER,
+            code: 0,
+            value: 0,
+        }
+    }
+}
+
 fn map_permissions(foreign_permissions: u8) -> u8 {
     let mut permissions: u8 = 0;
 
@@ -49,6 +96,7 @@ enum HookType {
     Write,
     ExecuteGeneric,
     ExecuteSpecific,
+    ExecuteRange,
     Violation,
     Interrupt,
     Block,
@@ -70,6 +118,10 @@ fn qualify_hook_id(hook_id: u32, hook_type: HookType) -> u32 {
     let hook_type: u32 = (hook_type as u8).into();
     let hook_type_mask: u32 = hook_type << 24;
     return (hook_id | hook_type_mask).into();
+}
+
+fn is_within_start_and_length(value: u64, start: u64, length: u64) -> bool {
+    return value >= start && value < start.wrapping_add(length);
 }
 
 pub struct HookContainer<Func: ?Sized> {
@@ -220,6 +272,7 @@ impl icicle_vm::CodeInjector for InstructionHookInjector {
 struct ExecutionHooks {
     stop: Rc<RefCell<bool>>,
     generic_hooks: HookContainer<dyn Fn(u64)>,
+    ranged_hooks: HookContainer<dyn Fn(u64)>,
     specific_hooks: HookContainer<dyn Fn(u64)>,
     block_hooks: HookContainer<dyn Fn(u64, u64)>,
     address_mapping: HashMap<u64, Vec<u32>>,
@@ -231,6 +284,7 @@ impl ExecutionHooks {
         Self {
             stop: stop_value,
             generic_hooks: HookContainer::new(),
+            ranged_hooks: HookContainer::new(),
             specific_hooks: HookContainer::new(),
             block_hooks: HookContainer::new(),
             address_mapping: HashMap::new(),
@@ -247,6 +301,10 @@ impl ExecutionHooks {
         }
 
         self.generic_hooks.for_each_hook(|func| {
+            func(address);
+        });
+
+        self.ranged_hooks.for_each_hook(|func| {
             func(address);
         });
 
@@ -289,9 +347,17 @@ impl ExecutionHooks {
         self.generic_hooks.add_hook(callback)
     }
 
+    pub fn add_range_hook(&mut self, start: u64, size: u64, callback: Box<dyn Fn(u64)>) -> u32 {
+        self.ranged_hooks
+            .add_hook(Box::new(move |address: u64| {
+                if size != 0 && is_within_start_and_length(address, start, size) {
+                    callback(address);
+                }
+            }))
+    }
+
     pub fn add_specific_hook(&mut self, address: u64, callback: Box<dyn Fn(u64)>) -> u32 {
         let id = self.specific_hooks.add_hook(callback);
-
         let mapping = self.address_mapping.entry(address).or_insert_with(Vec::new);
         mapping.push(id);
 
@@ -304,6 +370,10 @@ impl ExecutionHooks {
 
     pub fn remove_generic_hook(&mut self, id: u32) {
         self.generic_hooks.remove_hook(id);
+    }
+
+    pub fn remove_range_hook(&mut self, id: u32) {
+        self.ranged_hooks.remove_hook(id);
     }
 
     pub fn remove_specific_hook(&mut self, id: u32) {
@@ -319,6 +389,7 @@ impl ExecutionHooks {
 pub struct IcicleEmulator {
     executing_thread: std::thread::ThreadId,
     vm: icicle_vm::Vm,
+    last_stop: IcicleStopInfo,
     reg: registers::X86RegisterNodes,
     syscall_hooks: HookContainer<dyn Fn()>,
     interrupt_hooks: HookContainer<dyn Fn(i32)>,
@@ -411,6 +482,7 @@ impl IcicleEmulator {
         Self {
             stop: stop_value,
             executing_thread: std::thread::current().id(),
+            last_stop: IcicleStopInfo::none(),
             reg: registers::X86RegisterNodes::new(&virtual_machine.cpu.arch),
             vm: virtual_machine,
             syscall_hooks: HookContainer::new(),
@@ -427,6 +499,7 @@ impl IcicleEmulator {
 
     pub fn start(&mut self, count: u64) {
         self.executing_thread = std::thread::current().id();
+        self.last_stop = IcicleStopInfo::none();
 
         self.vm.icount_limit = match count {
             0 => u64::MAX,
@@ -443,16 +516,27 @@ impl IcicleEmulator {
             let reason = self.vm.run();
 
             match reason {
-                icicle_vm::VmExit::InstructionLimit => break,
+                icicle_vm::VmExit::InstructionLimit => {
+                    self.last_stop = IcicleStopInfo::instruction_limit();
+                    break;
+                }
                 icicle_vm::VmExit::UnhandledException((code, value)) => {
                     let continue_execution = self.handle_exception(code, value);
                     if !continue_execution {
+                        self.last_stop = IcicleStopInfo::unhandled_exception(code, value);
                         break;
                     }
                 }
-                _ => break,
+                _ => {
+                    self.last_stop = IcicleStopInfo::other();
+                    break;
+                }
             };
         }
+    }
+
+    pub fn last_stop_info(&self) -> IcicleStopInfo {
+        return self.last_stop;
     }
 
     fn handle_interrupt(&mut self, code: i32) -> bool {
@@ -470,6 +554,8 @@ impl IcicleEmulator {
             ExceptionCode::WritePerm => self.handle_violation(value, FOREIGN_WRITE, false),
             ExceptionCode::ReadUnmapped => self.handle_violation(value, FOREIGN_READ, true),
             ExceptionCode::WriteUnmapped => self.handle_violation(value, FOREIGN_WRITE, true),
+            ExceptionCode::ExecViolation => self.handle_violation(value, FOREIGN_EXEC, false),
+            ExceptionCode::SelfModifyingCode => self.handle_self_modifying_code(),
             ExceptionCode::SoftwareBreakpoint => self.handle_interrupt(3),
             ExceptionCode::InvalidInstruction => self.handle_interrupt(6),
             ExceptionCode::DivisionException => self.handle_interrupt(0),
@@ -477,6 +563,12 @@ impl IcicleEmulator {
         };
 
         return continue_execution;
+    }
+
+    fn handle_self_modifying_code(&mut self) -> bool {
+        self.vm.code.flush_code();
+        self.vm.cpu.block_id = u64::MAX;
+        return true;
     }
 
     fn handle_violation(&mut self, address: u64, permission: u8, unmapped: bool) -> bool {
@@ -537,6 +629,19 @@ impl IcicleEmulator {
         return qualify_hook_id(hook_id, HookType::ExecuteGeneric);
     }
 
+    pub fn add_ranged_execution_hook(
+        &mut self,
+        start: u64,
+        size: u64,
+        callback: Box<dyn Fn(u64)>,
+    ) -> u32 {
+        let hook_id = self
+            .execution_hooks
+            .borrow_mut()
+            .add_range_hook(start, size, callback);
+        return qualify_hook_id(hook_id, HookType::ExecuteRange);
+    }
+
     pub fn add_syscall_hook(&mut self, callback: Box<dyn Fn()>) -> u32 {
         let hook_id = self.syscall_hooks.add_hook(callback);
         return qualify_hook_id(hook_id, HookType::Syscall);
@@ -594,6 +699,7 @@ impl IcicleEmulator {
                 .execution_hooks
                 .borrow_mut()
                 .remove_specific_hook(hook_id),
+            HookType::ExecuteRange => self.execution_hooks.borrow_mut().remove_range_hook(hook_id),
             HookType::Block => self.execution_hooks.borrow_mut().remove_block_hook(hook_id),
             HookType::Read => {
                 self.get_mem().remove_read_after_hook(hook_id);
@@ -685,6 +791,15 @@ impl IcicleEmulator {
         unsafe {
             self.vm.cpu.regs.write_at(0, buffer);
         };
+    }
+
+    // Deserializing reuses the live VM, so any execution state that a freshly built VM would not carry must be
+    // dropped here. save_registers/restore_registers only round-trip the register space; the instruction counter
+    // and the translated (and recompiled) code cache persist otherwise, so a restored run continues on state left
+    // over from the previous one instead of matching a fresh VM.
+    pub fn reset_volatile_state(&mut self) {
+        self.vm.cpu.icount = 0;
+        self.vm.code.flush_code();
     }
 
     fn read_generic_register(&mut self, reg: registers::X86Register, buffer: &mut [u8]) -> usize {

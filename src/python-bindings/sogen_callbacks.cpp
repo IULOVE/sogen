@@ -1,8 +1,9 @@
 #include "sogen_internal.hpp"
+#include <windows_emulator.hpp>
 
 #include <array>
 
-namespace sogen_py
+namespace sogen::py
 {
     namespace
     {

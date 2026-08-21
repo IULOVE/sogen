@@ -1,6 +1,7 @@
 #define ICICLE_EMULATOR_IMPL
 #include "icicle_x86_64_emulator.hpp"
 
+#include <cstdio>
 #include <unordered_set>
 #include <utils/object.hpp>
 #include <utils/finally.hpp>
@@ -20,6 +21,13 @@ extern "C"
     using data_accessor_func = void(void* user, const void* data, size_t length);
     using memory_access_func = icicle_mmio_write_func;
 
+    struct icicle_stop_info
+    {
+        uint32_t kind;
+        uint32_t code;
+        uint64_t value;
+    };
+
     icicle_emulator* icicle_create_emulator();
     int32_t icicle_protect_memory(icicle_emulator*, uint64_t address, uint64_t length, uint8_t permissions);
     int32_t icicle_map_memory(icicle_emulator*, uint64_t address, uint64_t length, uint8_t permissions);
@@ -30,12 +38,14 @@ extern "C"
     int32_t icicle_write_memory(icicle_emulator*, uint64_t address, const void* data, size_t length);
     void icicle_save_registers(icicle_emulator*, data_accessor_func* accessor, void* accessor_data);
     void icicle_restore_registers(icicle_emulator*, const void* data, size_t length);
+    void icicle_reset_volatile_state(icicle_emulator*);
     uint32_t icicle_create_snapshot(icicle_emulator*);
     void icicle_restore_snapshot(icicle_emulator*, uint32_t id);
     uint32_t icicle_add_syscall_hook(icicle_emulator*, raw_func* callback, void* data);
     uint32_t icicle_add_interrupt_hook(icicle_emulator*, interrupt_func* callback, void* data);
     uint32_t icicle_add_block_hook(icicle_emulator*, block_func* callback, void* data);
     uint32_t icicle_add_execution_hook(icicle_emulator*, uint64_t address, ptr_func* callback, void* data);
+    uint32_t icicle_add_ranged_execution_hook(icicle_emulator*, uint64_t address, uint64_t size, ptr_func* callback, void* data);
     uint32_t icicle_add_generic_execution_hook(icicle_emulator*, ptr_func* callback, void* data);
     uint32_t icicle_add_violation_hook(icicle_emulator*, violation_func* callback, void* data);
     uint32_t icicle_add_read_hook(icicle_emulator*, uint64_t start, uint64_t end, memory_access_func* cb, void* data);
@@ -44,12 +54,13 @@ extern "C"
     size_t icicle_read_register(icicle_emulator*, int reg, void* data, size_t length);
     size_t icicle_write_register(icicle_emulator*, int reg, const void* data, size_t length);
     void icicle_start(icicle_emulator*, size_t count);
+    int32_t icicle_get_stop_info(icicle_emulator*, icicle_stop_info* info);
     void icicle_stop(icicle_emulator*);
     void icicle_destroy_emulator(icicle_emulator*);
     void icicle_run_on_next_instruction(icicle_emulator*, raw_func* callback, void* data);
 }
 
-namespace icicle
+namespace sogen::icicle
 {
     namespace
     {
@@ -102,12 +113,24 @@ namespace icicle
             return std::make_unique<function_object<T>>(std::move(func), &hook_state);
         }
 
+        // memory_access_hook_callback with the leading cpu_interface& stripped: bind_cpu binds icicle's
+        // single vCPU into the callback (icicle is single-vCPU), so the stored callback takes no cpu.
+        using bound_memory_access_hook_callback = std::function<void(uint64_t address, const void* data, size_t size)>;
+
         struct memory_access_hook
         {
             uint64_t address{};
             uint64_t size{};
-            memory_access_hook_callback callback{};
+            bound_memory_access_hook_callback callback{};
             bool is_read{};
+        };
+
+        enum class icicle_stop_kind : uint32_t
+        {
+            none = 0,
+            instruction_limit = 1,
+            unhandled_exception = 2,
+            other = 3,
         };
     }
 
@@ -139,6 +162,8 @@ namespace icicle
         void start(const size_t count) override
         {
             icicle_start(this->emu_, count);
+            this->throw_if_unhandled_stop();
+            this->perform_pending_actions();
         }
 
         void stop() override
@@ -296,6 +321,14 @@ namespace icicle
             ice(res, "Failed to apply permissions");
         }
 
+        // The raw icicle hook wrappers are captureless function pointers, so the
+        // triggering CPU is bound into the stored function up front.
+        template <typename Ret, typename... Args>
+        std::function<Ret(Args...)> bind_cpu(std::function<Ret(cpu_interface&, Args...)> callback)
+        {
+            return [this, c = std::move(callback)](Args... args) { return c(*this, std::forward<Args>(args)...); };
+        }
+
         emulator_hook* hook_instruction(int instruction_type, instruction_hook_callback callback) override
         {
             if (static_cast<x86_hookable_instructions>(instruction_type) != x86_hookable_instructions::syscall)
@@ -304,7 +337,7 @@ namespace icicle
                 return nullptr;
             }
 
-            auto obj = make_function_object(std::move(callback), this->is_in_hook_);
+            auto obj = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
             auto* ptr = obj.get();
 
             const auto invoker = +[](void* cb) {
@@ -320,7 +353,7 @@ namespace icicle
 
         emulator_hook* hook_basic_block(basic_block_hook_callback callback) override
         {
-            auto object = make_function_object(std::move(callback), this->is_in_hook_);
+            auto object = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
             auto* ptr = object.get();
             auto* wrapper = +[](void* user, const uint64_t addr, const uint64_t instructions) {
                 basic_block block{};
@@ -339,7 +372,7 @@ namespace icicle
 
         emulator_hook* hook_interrupt(interrupt_hook_callback callback) override
         {
-            auto obj = make_function_object(std::move(callback), this->is_in_hook_);
+            auto obj = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
             auto* ptr = obj.get();
             auto* wrapper = +[](void* user, const int32_t code) {
                 const auto& func = *static_cast<decltype(ptr)>(user);
@@ -354,7 +387,7 @@ namespace icicle
 
         emulator_hook* hook_memory_violation(memory_violation_hook_callback callback) override
         {
-            auto obj = make_function_object(std::move(callback), this->is_in_hook_);
+            auto obj = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
             auto* ptr = obj.get();
             auto* wrapper = +[](void* user, const uint64_t address, const uint8_t operation, const int32_t unmapped) -> int32_t {
                 const auto violation_type = unmapped //
@@ -376,7 +409,7 @@ namespace icicle
 
         emulator_hook* hook_memory_execution(const uint64_t address, memory_execution_hook_callback callback) override
         {
-            auto object = make_function_object(std::move(callback), this->is_in_hook_);
+            auto object = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
             auto* ptr = object.get();
             auto* wrapper = +[](void* user, const uint64_t addr) {
                 const auto& func = *static_cast<decltype(ptr)>(user);
@@ -389,9 +422,30 @@ namespace icicle
             return wrap_hook(id);
         }
 
+        emulator_hook* hook_memory_range_execution(const uint64_t address, const uint64_t size,
+                                                   memory_execution_hook_callback callback) override
+        {
+            if (size == 1)
+            {
+                return this->hook_memory_execution(address, std::move(callback));
+            }
+
+            auto object = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
+            auto* ptr = object.get();
+            auto* wrapper = +[](void* user, const uint64_t addr) {
+                const auto& func = *static_cast<decltype(ptr)>(user);
+                (func)(addr);
+            };
+
+            const auto id = icicle_add_ranged_execution_hook(this->emu_, address, size, wrapper, ptr);
+            this->hooks_[id] = std::move(object);
+
+            return wrap_hook(id);
+        }
+
         emulator_hook* hook_memory_execution(memory_execution_hook_callback callback) override
         {
-            auto object = make_function_object(std::move(callback), this->is_in_hook_);
+            auto object = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
             auto* ptr = object.get();
             auto* wrapper = +[](void* user, const uint64_t addr) {
                 const auto& func = *static_cast<decltype(ptr)>(user);
@@ -409,7 +463,7 @@ namespace icicle
             return this->try_install_memory_access_hook(memory_access_hook{
                 .address = address,
                 .size = size,
-                .callback = std::move(callback),
+                .callback = this->bind_cpu(std::move(callback)),
                 .is_read = true,
             });
         }
@@ -419,7 +473,7 @@ namespace icicle
             return this->try_install_memory_access_hook(memory_access_hook{
                 .address = address,
                 .size = size,
-                .callback = std::move(callback),
+                .callback = this->bind_cpu(std::move(callback)),
                 .is_read = false,
             });
         }
@@ -429,7 +483,6 @@ namespace icicle
             if (this->is_in_hook_)
             {
                 this->hooks_to_delete_.insert(hook);
-                this->schedule_action_execution();
             }
             else
             {
@@ -459,6 +512,7 @@ namespace icicle
             }
             else
             {
+                icicle_reset_volatile_state(this->emu_);
                 const auto data = buffer.read_vector<std::byte>();
                 this->restore_registers(data);
             }
@@ -493,6 +547,16 @@ namespace icicle
             return true;
         }
 
+        bool is_stop_thread_safe() const override
+        {
+            return true;
+        }
+
+        bool supports_multiple_vcpus() const override
+        {
+            return false;
+        }
+
         std::string get_name() const override
         {
             return "icicle-emu";
@@ -517,6 +581,33 @@ namespace icicle
             this->id_mapping_[hook] = icicle_id;
 
             return hook;
+        }
+
+        void throw_if_unhandled_stop()
+        {
+            icicle_stop_info info{};
+            ice(icicle_get_stop_info(this->emu_, &info) != 0, "Failed to read icicle stop info");
+
+            const auto kind = static_cast<icicle_stop_kind>(info.kind);
+            if (kind == icicle_stop_kind::none || kind == icicle_stop_kind::instruction_limit)
+            {
+                return;
+            }
+
+            std::array<char, 160> message{};
+            if (kind == icicle_stop_kind::unhandled_exception)
+            {
+                std::snprintf(message.data(), message.size(), "Icicle stopped on unhandled exception: code=0x%X value=0x%llX rip=0x%llX",
+                              info.code, static_cast<unsigned long long>(info.value),
+                              static_cast<unsigned long long>(this->read_instruction_pointer()));
+            }
+            else
+            {
+                std::snprintf(message.data(), message.size(), "Icicle stopped on unhandled VM exit at rip=0x%llX",
+                              static_cast<unsigned long long>(this->read_instruction_pointer()));
+            }
+
+            throw std::runtime_error(message.data());
         }
 
         emulator_hook* hook_memory_access(memory_access_hook hook, emulator_hook* hook_id)
@@ -572,20 +663,25 @@ namespace icicle
 
         void perform_pending_actions()
         {
-            auto hooks_to_install = std::move(this->hooks_to_install_);
             const auto hooks_to_delete = std::move(this->hooks_to_delete_);
 
             this->hooks_to_delete_ = {};
+            this->perform_pending_hook_installs();
+
+            for (auto* hook : hooks_to_delete)
+            {
+                this->delete_hook_internal(hook);
+            }
+        }
+
+        void perform_pending_hook_installs()
+        {
+            auto hooks_to_install = std::move(this->hooks_to_install_);
             this->hooks_to_install_ = {};
 
             for (auto& hook : hooks_to_install)
             {
                 this->hook_memory_access(std::move(hook.second), hook.first);
-            }
-
-            for (auto* hook : hooks_to_delete)
-            {
-                this->delete_hook_internal(hook);
             }
         }
 
@@ -607,7 +703,7 @@ namespace icicle
         void schedule_action_execution()
         {
             this->run_on_next_instruction([this] {
-                this->perform_pending_actions(); //
+                this->perform_pending_hook_installs(); //
             });
         }
 
@@ -637,4 +733,4 @@ namespace icicle
     {
         return std::make_unique<icicle_x86_64_emulator>();
     }
-}
+} // namespace sogen::icicle

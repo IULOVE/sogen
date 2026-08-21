@@ -1,6 +1,7 @@
 #include "sogen_internal.hpp"
+#include <windows_emulator.hpp>
 
-namespace sogen_py
+namespace sogen::py
 {
     std::string stop_reason_to_string(const stop_reason reason)
     {
@@ -14,6 +15,22 @@ namespace sogen_py
             return "unimplemented_syscall";
         case stop_reason::syscall_exception:
             return "syscall_exception";
+        case stop_reason::instruction_limit:
+            return "instruction_limit";
+        case stop_reason::normal_exit:
+            return "normal_exit";
+        case stop_reason::signal_termination:
+            return "signal_termination";
+        case stop_reason::unhandled_memory_violation:
+            return "unhandled_memory_violation";
+        case stop_reason::explicit_stop:
+            return "explicit_stop";
+        case stop_reason::backend_error:
+            return "backend_error";
+        case stop_reason::breakpoint:
+            return "breakpoint";
+        case stop_reason::watchpoint:
+            return "watchpoint";
         }
 
         return "unknown";
